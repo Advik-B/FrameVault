@@ -1,4 +1,4 @@
-# yt-store
+# FrameVault
 
 A research study into extracting free, unlimited, lossless storage from YouTube by encoding arbitrary binary data into video frames and an audio FSK channel.
 
