@@ -252,23 +252,22 @@ def decode(video_path: str, output_dir: str = "."):
             if qr_meta:
                 print(f"  QR metadata decoded from frame {total}.")
                 qr_index_bits = qr_meta.get("index_bits")
-                if qr_index_bits is None:
-                    pass
-                elif qr_index_bits not in (DEFAULT_FRAME_INDEX_BITS, EXTENDED_FRAME_INDEX_BITS):
-                    print(f"  Warning: unsupported index width {qr_index_bits}; using {index_bits}-bit.")
-                elif qr_index_bits != index_bits:
-                    old_index_bits = index_bits
-                    if frames or early_frames:
-                        print(
-                            f"  Warning: unexpected index width change from {old_index_bits} to "
-                            f"{qr_index_bits} bits; this may indicate corrupted or mixed sources. "
-                            "Discarding previously decoded frames."
-                        )
-                        frames = {}
-                        early_frames = {}
-                    index_bits = qr_index_bits
-                    header_bits, data_bits_per_frame = frame_layout(index_bits)
-                    data_bytes_per_frame = data_bits_per_frame // 8
+                if qr_index_bits is not None:
+                    if qr_index_bits not in (DEFAULT_FRAME_INDEX_BITS, EXTENDED_FRAME_INDEX_BITS):
+                        print(f"  Warning: unsupported index width {qr_index_bits}; using {index_bits}-bit.")
+                    elif qr_index_bits != index_bits:
+                        old_index_bits = index_bits
+                        if frames or early_frames:
+                            print(
+                                f"  Warning: unexpected index width change from {old_index_bits} to "
+                                f"{qr_index_bits} bits; this may indicate corrupted or mixed sources. "
+                                "Discarding previously decoded frames."
+                            )
+                            frames = {}
+                            early_frames = {}
+                        index_bits = qr_index_bits
+                        header_bits, data_bits_per_frame = frame_layout(index_bits)
+                        data_bytes_per_frame = data_bits_per_frame // 8
         bits = read_blocks(frame_np)
         idx, data_bits = decode_frame(bits, index_bits, header_bits)
         if idx is None:

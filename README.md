@@ -63,7 +63,7 @@ Each 1920×1080 frame contains a 30×16 grid of 64×64 pixel blocks:
 +--------+--------+--------+--------+--------+  ...  +--------+
 | SYNC 0 | SYNC 1 | SYNC 2 | SYNC 3 | SYNC 4 |       | SYNC 7 |  <- row 0, cols 0-7:  sync pattern
 +--------+--------+--------+--------+--------+       +--------+
-| IDX 0  | IDX 1  | IDX 2  |  ...                   | IDX 15 |  <- row 0, cols 8-23: frame index (16-bit default; 32-bit continues past col 23)
+| IDX 0  | IDX 1  | IDX 2  |  ...                   | IDX 15 |  <- row 0, cols 8-23: frame index (16-bit default; 32-bit spans cols 8-39)
 +--------+--------+--------+                         +--------+
 | DATA   | DATA   | DATA   | DATA   | DATA   |  ...  | DATA   |  <- remaining 456 blocks: data
 +--------+--------+--------+--------+--------+       +--------+
