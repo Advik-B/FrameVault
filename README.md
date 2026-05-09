@@ -79,6 +79,8 @@ Each 1920×1080 frame contains a 30×16 grid of 64×64 pixel blocks:
 The first 1 second (`METADATA_DURATION_SEC`) in the video is reserved for QR metadata
 and does **not** contain data blocks. The decoder uses these frames to learn the
 expected ECC length, frame count, and SHA256 before assembling payload data.
+QR metadata also carries the frame index width (`i`) along with filename, size,
+ECC length, and metadata frame count.
 
 Each block is sampled at its center 32×32 region (the inner half, margin = 16px). Block edges are where DCT compression artifacts accumulate; the center is clean.
 
