@@ -243,7 +243,7 @@ To increase audio coverage: raise `BAUD_RATE` in both scripts. 200 baud doubles 
 
 **YouTube re-encoding is untested.** The local round-trip works. YouTube's actual VP9/H.264 output has not yet been tested against this codec. The 64×64 block size was chosen conservatively for this reason. If YouTube's encoder corrupts blocks, the first thing to try is increasing `BLOCK_SIZE` to 128.
 
-**ECC is RS, not erasure-coded.** RS error correction handles both errors and erasures, but the decoder currently only uses error correction (not the more powerful erasure mode). Erasure decoding would require tracking exactly which byte positions correspond to failed frames and passing that to reedsolo. This doubles the correctable error count for known-bad positions.
+**ECC is RS (with erasures for missing frames).** RS handles both errors and erasures. The decoder already treats bytes from sync-failed frames as erasures (known-missing positions) when calling `reedsolo`, which improves recovery vs. pure error correction. Corruption inside frames that still pass sync is still handled as errors.
 
 **Audio coverage is partial for large files.** Audio only carries the first N bytes of the ECC stream. For files where the video channel has widespread failures and audio doesn't cover the affected range, recovery fails. Full redundancy would require a second pass or interleaved encoding.
 
