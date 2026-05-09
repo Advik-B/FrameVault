@@ -1,0 +1,221 @@
+#!/usr/bin/env python3
+
+import sys
+import os
+import json
+import hashlib
+import struct
+import subprocess
+import tempfile
+import wave
+import numpy as np
+from pathlib import Path
+
+import reedsolo
+
+# Video
+FRAME_WIDTH = 1920
+FRAME_HEIGHT = 1080
+FRAME_RATE = 30
+BLOCK_SIZE = 64
+COLS = FRAME_WIDTH // BLOCK_SIZE    # 30
+ROWS = FRAME_HEIGHT // BLOCK_SIZE   # 16
+TOTAL_BLOCKS = COLS * ROWS          # 480
+
+# Frame layout: [8 sync bits][16 index bits][456 data bits]
+SYNC_PATTERN = np.array([1, 0, 1, 0, 1, 1, 0, 0], dtype=np.uint8)
+FRAME_INDEX_BITS = 16               # max 65535 frames (~36 min at 30fps)
+HEADER_BITS = len(SYNC_PATTERN) + FRAME_INDEX_BITS  # 24
+DATA_BITS_PER_FRAME = TOTAL_BLOCKS - HEADER_BITS    # 456 bits = 57 bytes/frame
+
+# Audio (4-FSK)
+SAMPLE_RATE = 44100
+BAUD_RATE = 100                     # symbols/sec
+BITS_PER_SYMBOL = 2
+SAMPLES_PER_SYMBOL = SAMPLE_RATE // BAUD_RATE  # 441 samples/symbol
+FSK_FREQS = [1000, 1200, 1400, 1600]           # Hz for symbols 0-3
+BYTES_PER_SEC_AUDIO = (BAUD_RATE * BITS_PER_SYMBOL) // 8  # 25 bytes/sec
+
+# Reed-Solomon
+RS_ECC_SYMBOLS = 32                 # ECC bytes per 255-byte RS block
+
+ENCODING_VERSION = 1
+
+
+def build_payload(filepath: str):
+    path = Path(filepath)
+    raw = path.read_bytes()
+    sha256 = hashlib.sha256(raw).hexdigest()
+    meta = {
+        "v": ENCODING_VERSION,
+        "filename": path.name,
+        "size": len(raw),
+        "sha256": sha256,
+    }
+    meta_bytes = json.dumps(meta, separators=(",", ":")).encode()
+    # Layout: [4 bytes: meta_len][meta JSON][raw file bytes]
+    payload = struct.pack(">I", len(meta_bytes)) + meta_bytes + raw
+    return payload, meta
+
+
+def ecc_encode(data: bytes) -> bytes:
+    # reedsolo chunks into (255 - RS_ECC_SYMBOLS) = 223 byte data blocks
+    # Each block gets RS_ECC_SYMBOLS parity bytes appended
+    print(f"  Input: {len(data):,} bytes")
+    rs = reedsolo.RSCodec(RS_ECC_SYMBOLS)
+    encoded = bytes(rs.encode(data))
+    print(f"  ECC output: {len(encoded):,} bytes ({(len(encoded)/len(data)-1)*100:.1f}% overhead)")
+    return encoded
+
+
+def index_to_bits(idx: int) -> np.ndarray:
+    return np.array(
+        [(idx >> (FRAME_INDEX_BITS - 1 - i)) & 1 for i in range(FRAME_INDEX_BITS)],
+        dtype=np.uint8
+    )
+
+
+def make_frame(frame_idx: int, data_bits: np.ndarray) -> bytes:
+    header = np.concatenate([SYNC_PATTERN, index_to_bits(frame_idx)])
+    block_bits = np.concatenate([header, data_bits])            # (480,)
+    grid = (block_bits.reshape(ROWS, COLS) * 255).astype(np.uint8)  # (16, 30)
+    frame_2d = np.repeat(np.repeat(grid, BLOCK_SIZE, axis=0), BLOCK_SIZE, axis=1)  # (1080, 1920)
+    # Pad the unused bottom 56 pixels so every frame is a true 1920x1080 buffer.
+    full_frame = np.zeros((FRAME_HEIGHT, FRAME_WIDTH), dtype=np.uint8)
+    full_frame[:frame_2d.shape[0], :frame_2d.shape[1]] = frame_2d
+    frame_rgb = np.stack([full_frame, full_frame, full_frame], axis=2)    # (1080, 1920, 3)
+    return frame_rgb.tobytes()
+
+
+def make_audio_pcm(data: bytes, duration_sec: float) -> bytes:
+    bits = np.unpackbits(np.frombuffer(data, dtype=np.uint8))
+
+    # Group into 2-bit symbols
+    n = (len(bits) // BITS_PER_SYMBOL) * BITS_PER_SYMBOL
+    symbols = bits[:n].reshape(-1, BITS_PER_SYMBOL)
+    symbols = symbols[:, 0] * 2 + symbols[:, 1]    # (N,) values 0-3
+
+    total_samples = int(SAMPLE_RATE * duration_sec)
+    max_symbols = total_samples // SAMPLES_PER_SYMBOL
+    symbols = symbols[:max_symbols]
+
+    # Vectorized tone generation: (N, SAMPLES_PER_SYMBOL)
+    freqs = np.array(FSK_FREQS)[symbols].astype(np.float32)     # (N,)
+    t = np.arange(SAMPLES_PER_SYMBOL, dtype=np.float32) / SAMPLE_RATE  # (S,)
+    phases = 2 * np.pi * freqs[:, np.newaxis] * t[np.newaxis, :]
+    tones = np.sin(phases).flatten().astype(np.float32)
+
+    audio = np.zeros(total_samples, dtype=np.float32)
+    audio[:len(tones)] = tones
+
+    peak = np.max(np.abs(audio))
+    if peak > 0:
+        audio = audio / peak * 0.9
+
+    return (audio * 32767).astype(np.int16).tobytes()
+
+
+def write_wav(pcm: bytes, path: str):
+    with wave.open(path, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(SAMPLE_RATE)
+        wf.writeframes(pcm)
+
+
+def encode(input_path: str, output_path: str):
+    print(f"[1/5] Reading file: {input_path}")
+    payload, meta = build_payload(input_path)
+    print(f"      {meta['filename']} | {meta['size']:,} bytes")
+    print(f"      SHA256: {meta['sha256']}")
+    print(f"      Payload (metadata + data): {len(payload):,} bytes")
+
+    print("\n[2/5] Reed-Solomon ECC...")
+    ecc_data = ecc_encode(payload)
+
+    all_bits = np.unpackbits(np.frombuffer(ecc_data, dtype=np.uint8))
+    rem = len(all_bits) % DATA_BITS_PER_FRAME
+    if rem:
+        all_bits = np.concatenate([all_bits, np.zeros(DATA_BITS_PER_FRAME - rem, dtype=np.uint8)])
+
+    num_frames = len(all_bits) // DATA_BITS_PER_FRAME
+    duration_sec = num_frames / FRAME_RATE
+
+    video_bps = DATA_BITS_PER_FRAME * FRAME_RATE // 8
+    audio_byte_count = min(len(ecc_data), int(duration_sec * BYTES_PER_SEC_AUDIO))
+    audio_coverage_pct = audio_byte_count / len(ecc_data) * 100
+
+    print(f"\n[3/5] Plan")
+    print(f"      Frames:         {num_frames:,} @ {FRAME_RATE}fps ({duration_sec:.1f}s)")
+    print(f"      Video channel:  {video_bps:,} bytes/sec ({DATA_BITS_PER_FRAME} bits/frame)")
+    print(f"      Audio channel:  {BYTES_PER_SEC_AUDIO} bytes/sec (4-FSK @ {BAUD_RATE} baud)")
+    print(f"      Audio covers:   {audio_byte_count:,}/{len(ecc_data):,} bytes ({audio_coverage_pct:.1f}%)")
+    if audio_coverage_pct < 100:
+        print(f"      Note: audio carries only the first {audio_coverage_pct:.1f}% of data;")
+        print(f"            increase BAUD_RATE or use a shorter file for full coverage.")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        audio_path = os.path.join(tmp, "audio.wav")
+
+        print(f"\n[4/5] Generating audio track...")
+        pcm = make_audio_pcm(ecc_data[:audio_byte_count], duration_sec)
+        write_wav(pcm, audio_path)
+        print(f"      Written: {os.path.getsize(audio_path):,} bytes (WAV, mono, {SAMPLE_RATE}Hz)")
+
+        print(f"\n[5/5] Encoding video frames and muxing...")
+        ffmpeg_cmd = [
+            "ffmpeg", "-y",
+            "-f", "rawvideo",
+            "-pixel_format", "rgb24",
+            "-video_size", f"{FRAME_WIDTH}x{FRAME_HEIGHT}",
+            "-framerate", str(FRAME_RATE),
+            "-i", "pipe:0",
+            "-i", audio_path,
+            "-c:v", "libx264",
+            "-crf", "0",           # lossless H.264 for the local source file
+            "-preset", "ultrafast",
+            "-pix_fmt", "yuv420p", # required for YouTube compatibility
+            "-c:a", "aac",
+            "-b:a", "320k",
+            output_path,
+        ]
+
+        proc = subprocess.Popen(
+            ffmpeg_cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+        for i in range(num_frames):
+            chunk = all_bits[i * DATA_BITS_PER_FRAME:(i + 1) * DATA_BITS_PER_FRAME]
+            proc.stdin.write(make_frame(i, chunk))
+            if i % 30 == 0 or i == num_frames - 1:
+                pct = (i + 1) / num_frames * 100
+                bar = "#" * (int(pct) // 2) + "-" * (50 - int(pct) // 2)
+                print(f"      [{bar}] {pct:5.1f}%  ({i+1}/{num_frames})", end="\r", flush=True)
+
+        proc.stdin.close()
+        ret = proc.wait()
+        print()
+
+        if ret != 0:
+            sys.exit("ffmpeg exited with an error. Make sure ffmpeg is installed and libx264 is available.")
+
+    size_mb = os.path.getsize(output_path) / 1_000_000
+    print(f"\nDone.")
+    print(f"  Output:   {output_path} ({size_mb:.1f} MB)")
+    print(f"  Duration: {duration_sec:.1f}s")
+    print(f"  Frames:   {num_frames:,}")
+    print(f"  Upload this file to YouTube at 1080p60 or higher.")
+    print(f"  Decode by downloading at 1080p and extracting frames with ffmpeg.")
+
+
+if __name__ == "__main__":
+    if len(sys.argv) != 3:
+        print(f"Usage: python {sys.argv[0]} <input_file> <output.mp4>")
+        print(f"  <input_file>  any file you want to encode (binary or text)")
+        print(f"  <output.mp4>  YouTube-ready video output")
+        sys.exit(1)
+
+    encode(sys.argv[1], sys.argv[2])
