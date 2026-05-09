@@ -234,7 +234,7 @@ def encode(input_path: str, output_path: str):
     total_frames = num_frames + METADATA_FRAMES
     duration_sec = total_frames / FRAME_RATE
 
-    video_bps = data_bits_per_frame * FRAME_RATE // 8
+    video_bps = (data_bits_per_frame * FRAME_RATE) // 8
     audio_byte_count = min(len(ecc_data), int(duration_sec * BYTES_PER_SEC_AUDIO))
     audio_coverage_pct = audio_byte_count / len(ecc_data) * 100
 
