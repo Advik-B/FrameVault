@@ -248,7 +248,7 @@ def decode(video_path: str, output_dir: str = "."):
     for frame_np in stream_frames(video_path):
         total += 1
         if total <= METADATA_FRAMES and qr_meta is None:
-                qr_meta = decode_qr_metadata(frame_np, qr_detector)
+            qr_meta = decode_qr_metadata(frame_np, qr_detector)
             if qr_meta:
                 print(f"  QR metadata decoded from frame {total}.")
                 qr_index_bits = qr_meta.get("index_bits")
