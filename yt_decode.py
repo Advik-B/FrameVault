@@ -39,7 +39,8 @@ FSK_FREQS = [1000, 1200, 1400, 1600]
 RS_ECC_SYMBOLS = 32
 
 # Metadata QR
-METADATA_FRAMES = 5
+METADATA_DURATION_SEC = 1.0
+METADATA_FRAMES = max(1, int(round(FRAME_RATE * METADATA_DURATION_SEC)))
 
 # How many pixels in from each block edge to sample.
 # Block edges are where DCT compression artifacts cluster.

@@ -37,7 +37,7 @@ input file
 [Reed-Solomon ECC]  +14% overhead, 32 ECC symbols per 255-byte block
     |
     v
-[QR metadata frames]  <-- first N frames (QR metadata for decoder)
+[QR metadata frames]  <-- first 1 second (QR metadata for decoder)
     |
     +---------------------------+
     |                           |
@@ -75,9 +75,9 @@ Each 1920×1080 frame contains a 30×16 grid of 64×64 pixel blocks:
 - Frame index: 16-bit big-endian integer. Supports up to 65,535 frames (~36 minutes at 30fps).
 - Data: 456 bits = 57 bytes of Reed-Solomon encoded payload per frame.
 
-The first `METADATA_FRAMES` in the video are reserved for QR metadata and do **not**
-contain data blocks. The decoder uses these frames to learn the expected ECC length,
-frame count, and SHA256 before assembling payload data.
+The first 1 second (`METADATA_DURATION_SEC`) in the video is reserved for QR metadata
+and does **not** contain data blocks. The decoder uses these frames to learn the
+expected ECC length, frame count, and SHA256 before assembling payload data.
 
 Each block is sampled at its center 32×32 region (the inner half, margin = 16px). Block edges are where DCT compression artifacts accumulate; the center is clean.
 
@@ -109,7 +109,7 @@ rgb24 raw frames          44100Hz s16le mono
     |                           |
     v                           v
 decode QR metadata        batch FFT per
-from first N frames       441-sample window
+from first 1 second       441-sample window
     |                           |
     v                           v
 expected length           argmax over
@@ -281,9 +281,9 @@ Metadata JSON fields:
 
 The RS-encoded payload is then split into 456-bit chunks, one chunk per video frame. The audio channel carries the RS-encoded bytes (not the raw payload) starting from byte 0.
 
-## QR metadata (first N frames)
+## QR metadata (first 1 second)
 
-The first `METADATA_FRAMES` are QR codes that carry compact metadata for the decoder:
+The first 1 second (`METADATA_DURATION_SEC`) is QR codes that carry compact metadata for the decoder:
 
 ```
 {

@@ -41,7 +41,8 @@ BYTES_PER_SEC_AUDIO = (BAUD_RATE * BITS_PER_SYMBOL) // 8  # 25 bytes/sec
 RS_ECC_SYMBOLS = 32                 # ECC bytes per 255-byte RS block
 
 # Metadata QR
-METADATA_FRAMES = 5
+METADATA_DURATION_SEC = 1.0
+METADATA_FRAMES = max(1, int(round(FRAME_RATE * METADATA_DURATION_SEC)))
 QR_BORDER_MODULES = 4
 QR_ERROR_CORRECTION = qrcode.constants.ERROR_CORRECT_Q
 QR_MIN_MODULE_PX = 6
@@ -202,7 +203,7 @@ def encode(input_path: str, output_path: str):
     audio_coverage_pct = audio_byte_count / len(ecc_data) * 100
 
     print(f"\n[3/5] Plan")
-    print(f"      Metadata frames:{METADATA_FRAMES:>10}")
+    print(f"      Metadata frames:{METADATA_FRAMES:>10} ({METADATA_DURATION_SEC:.1f}s)")
     print(f"      Data frames:    {num_frames:>10}")
     print(f"      Total frames:   {total_frames:>10} @ {FRAME_RATE}fps ({duration_sec:.1f}s)")
     print(f"      Video channel:  {video_bps:,} bytes/sec ({DATA_BITS_PER_FRAME} bits/frame)")
