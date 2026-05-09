@@ -36,6 +36,9 @@ input file
     v
 [Reed-Solomon ECC]  +14% overhead, 32 ECC symbols per 255-byte block
     |
+    v
+[QR metadata frames]  <-- first 1 second (QR metadata for decoder)
+    |
     +---------------------------+
     |                           |
     v                           v
@@ -72,6 +75,10 @@ Each 1920×1080 frame contains a 30×16 grid of 64×64 pixel blocks:
 - Frame index: 16-bit big-endian integer. Supports up to 65,535 frames (~36 minutes at 30fps).
 - Data: 456 bits = 57 bytes of Reed-Solomon encoded payload per frame.
 
+The first 1 second (`METADATA_DURATION_SEC`) in the video is reserved for QR metadata
+and does **not** contain data blocks. The decoder uses these frames to learn the
+expected ECC length, frame count, and SHA256 before assembling payload data.
+
 Each block is sampled at its center 32×32 region (the inner half, margin = 16px). Block edges are where DCT compression artifacts accumulate; the center is clean.
 
 ### Audio channel
@@ -101,12 +108,20 @@ ffmpeg pipe               ffmpeg PCM pipe
 rgb24 raw frames          44100Hz s16le mono
     |                           |
     v                           v
-center-sample             batch FFT per
-each 64x64 block          441-sample window
-threshold at 128          argmax over
-    |                     4 target bins
-    v                           |
-sync check                      v
+decode QR metadata        batch FFT per
+from first 1 second       441-sample window
+    |                           |
+    v                           v
+expected length           argmax over
+frames + SHA256           4 target bins
+    |
+    v
+center-sample
+each 64x64 block
+threshold at 128
+    |
+    v
+sync check
 frame index                 bit stream
     |                           |
     v                           v
@@ -150,7 +165,7 @@ A byte corrupted in the video channel has no correlation with whether the same b
 - yt-dlp (for downloading encoded videos back from YouTube)
 
 ```
-pip install reedsolo numpy
+pip install reedsolo numpy qrcode opencv-python-headless
 ```
 
 ---
@@ -228,7 +243,7 @@ To increase audio coverage: raise `BAUD_RATE` in both scripts. 200 baud doubles 
 
 **YouTube re-encoding is untested.** The local round-trip works. YouTube's actual VP9/H.264 output has not yet been tested against this codec. The 64×64 block size was chosen conservatively for this reason. If YouTube's encoder corrupts blocks, the first thing to try is increasing `BLOCK_SIZE` to 128.
 
-**ECC is RS, not erasure-coded.** RS error correction handles both errors and erasures, but the decoder currently only uses error correction (not the more powerful erasure mode). Erasure decoding would require tracking exactly which byte positions correspond to failed frames and passing that to reedsolo. This doubles the correctable error count for known-bad positions.
+**ECC is RS (with erasures for missing frames).** RS handles both errors and erasures. The decoder already treats bytes from sync-failed frames as erasures (known-missing positions) when calling `reedsolo`, which improves recovery vs. pure error correction. Corruption inside frames that still pass sync is still handled as errors.
 
 **Audio coverage is partial for large files.** Audio only carries the first N bytes of the ECC stream. For files where the video channel has widespread failures and audio doesn't cover the affected range, recovery fails. Full redundancy would require a second pass or interleaved encoding.
 
@@ -258,13 +273,29 @@ Payload layout (before ECC):
 +-------------------+---------------------------+-------------------+
 
 Metadata JSON fields:
-  v          encoding version (integer, currently 1)
+  v          encoding version (integer, currently 2)
   filename   original filename (string)
   size       original file size in bytes (integer)
   sha256     SHA256 hex digest of the original file bytes (string)
 ```
 
 The RS-encoded payload is then split into 456-bit chunks, one chunk per video frame. The audio channel carries the RS-encoded bytes (not the raw payload) starting from byte 0.
+
+## QR metadata (first 1 second)
+
+The first 1 second (`METADATA_DURATION_SEC`) is QR codes that carry compact metadata for the decoder:
+
+```
+{
+  "v": 2,              // encoding version
+  "f": "file.bin",     // filename
+  "s": 12345,          // size in bytes
+  "h": "sha256...",    // SHA256 hex
+  "e": 67890,          // ECC stream length in bytes
+  "n": 42,             // data frame count
+  "m": 5               // metadata frame count
+}
+```
 
 ---
 

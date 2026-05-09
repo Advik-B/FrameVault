@@ -12,6 +12,7 @@ import numpy as np
 from pathlib import Path
 
 import reedsolo
+import qrcode
 
 # Video
 FRAME_WIDTH = 1920
@@ -39,7 +40,14 @@ BYTES_PER_SEC_AUDIO = (BAUD_RATE * BITS_PER_SYMBOL) // 8  # 25 bytes/sec
 # Reed-Solomon
 RS_ECC_SYMBOLS = 32                 # ECC bytes per 255-byte RS block
 
-ENCODING_VERSION = 1
+# Metadata QR
+METADATA_DURATION_SEC = 1.0
+METADATA_FRAMES = max(1, int(round(FRAME_RATE * METADATA_DURATION_SEC)))
+QR_BORDER_MODULES = 4
+QR_ERROR_CORRECTION = qrcode.constants.ERROR_CORRECT_Q
+QR_MIN_MODULE_PX = 6
+
+ENCODING_VERSION = 2
 
 
 def build_payload(filepath: str):
@@ -56,6 +64,19 @@ def build_payload(filepath: str):
     # Layout: [4 bytes: meta_len][meta JSON][raw file bytes]
     payload = struct.pack(">I", len(meta_bytes)) + meta_bytes + raw
     return payload, meta
+
+
+def build_qr_metadata(meta: dict, ecc_len: int, num_frames: int) -> bytes:
+    qr_meta = {
+        "v": ENCODING_VERSION,
+        "f": meta["filename"],
+        "s": meta["size"],
+        "h": meta["sha256"],
+        "e": ecc_len,
+        "n": num_frames,
+        "m": METADATA_FRAMES,
+    }
+    return json.dumps(qr_meta, separators=(",", ":")).encode()
 
 
 def ecc_encode(data: bytes) -> bytes:
@@ -84,6 +105,39 @@ def make_frame(frame_idx: int, data_bits: np.ndarray) -> bytes:
     full_frame = np.zeros((FRAME_HEIGHT, FRAME_WIDTH), dtype=np.uint8)
     full_frame[:frame_2d.shape[0], :frame_2d.shape[1]] = frame_2d
     frame_rgb = np.stack([full_frame, full_frame, full_frame], axis=2)    # (1080, 1920, 3)
+    return frame_rgb.tobytes()
+
+
+def make_qr_frame(payload: bytes) -> bytes:
+    qr = qrcode.QRCode(
+        error_correction=QR_ERROR_CORRECTION,
+        box_size=1,
+        border=QR_BORDER_MODULES,
+    )
+    qr.add_data(payload)
+    qr.make(fit=True)
+    matrix = np.array(qr.get_matrix(), dtype=np.uint8)
+    modules = matrix.shape[0]
+
+    max_width = FRAME_WIDTH - 2 * BLOCK_SIZE
+    max_height = FRAME_HEIGHT - 2 * BLOCK_SIZE
+    module_px = min(max_width // modules, max_height // modules)
+    if module_px < QR_MIN_MODULE_PX:
+        raise ValueError(
+            f"QR modules too small ({module_px}px). "
+            f"Shorten metadata or reduce QR error correction."
+        )
+
+    qr_pixels = np.where(matrix == 1, 0, 255).astype(np.uint8)
+    qr_pixels = np.kron(qr_pixels, np.ones((module_px, module_px), dtype=np.uint8))
+
+    qr_frame = np.full((FRAME_HEIGHT, FRAME_WIDTH), 255, dtype=np.uint8)
+    h, w = qr_pixels.shape
+    y0 = (FRAME_HEIGHT - h) // 2
+    x0 = (FRAME_WIDTH - w) // 2
+    qr_frame[y0:y0 + h, x0:x0 + w] = qr_pixels
+
+    frame_rgb = np.stack([qr_frame, qr_frame, qr_frame], axis=2)
     return frame_rgb.tobytes()
 
 
@@ -139,14 +193,19 @@ def encode(input_path: str, output_path: str):
         all_bits = np.concatenate([all_bits, np.zeros(DATA_BITS_PER_FRAME - rem, dtype=np.uint8)])
 
     num_frames = len(all_bits) // DATA_BITS_PER_FRAME
-    duration_sec = num_frames / FRAME_RATE
+    qr_payload = build_qr_metadata(meta, len(ecc_data), num_frames)
+    qr_frame = make_qr_frame(qr_payload)
+    total_frames = num_frames + METADATA_FRAMES
+    duration_sec = total_frames / FRAME_RATE
 
     video_bps = DATA_BITS_PER_FRAME * FRAME_RATE // 8
     audio_byte_count = min(len(ecc_data), int(duration_sec * BYTES_PER_SEC_AUDIO))
     audio_coverage_pct = audio_byte_count / len(ecc_data) * 100
 
     print(f"\n[3/5] Plan")
-    print(f"      Frames:         {num_frames:,} @ {FRAME_RATE}fps ({duration_sec:.1f}s)")
+    print(f"      Metadata frames:{METADATA_FRAMES:>10} ({METADATA_DURATION_SEC:.1f}s)")
+    print(f"      Data frames:    {num_frames:>10}")
+    print(f"      Total frames:   {total_frames:>10} @ {FRAME_RATE}fps ({duration_sec:.1f}s)")
     print(f"      Video channel:  {video_bps:,} bytes/sec ({DATA_BITS_PER_FRAME} bits/frame)")
     print(f"      Audio channel:  {BYTES_PER_SEC_AUDIO} bytes/sec (4-FSK @ {BAUD_RATE} baud)")
     print(f"      Audio covers:   {audio_byte_count:,}/{len(ecc_data):,} bytes ({audio_coverage_pct:.1f}%)")
@@ -187,13 +246,18 @@ def encode(input_path: str, output_path: str):
             stderr=subprocess.DEVNULL,
         )
 
+        for _ in range(METADATA_FRAMES):
+            proc.stdin.write(qr_frame)
+
+        written = METADATA_FRAMES
         for i in range(num_frames):
             chunk = all_bits[i * DATA_BITS_PER_FRAME:(i + 1) * DATA_BITS_PER_FRAME]
             proc.stdin.write(make_frame(i, chunk))
-            if i % 30 == 0 or i == num_frames - 1:
-                pct = (i + 1) / num_frames * 100
+            written += 1
+            if written % 30 == 0 or written == total_frames:
+                pct = written / total_frames * 100
                 bar = "#" * (int(pct) // 2) + "-" * (50 - int(pct) // 2)
-                print(f"      [{bar}] {pct:5.1f}%  ({i+1}/{num_frames})", end="\r", flush=True)
+                print(f"      [{bar}] {pct:5.1f}%  ({written}/{total_frames})", end="\r", flush=True)
 
         proc.stdin.close()
         ret = proc.wait()
