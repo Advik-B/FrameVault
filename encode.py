@@ -218,7 +218,8 @@ def encode(input_path: str, output_path: str):
         num_frames = math.ceil(total_bits / data_bits_per_frame)
         if num_frames > MAX_FRAME_COUNT_EXTENDED:
             raise ValueError(
-                f"Payload needs {num_frames} frames which exceeds 32-bit limit ({MAX_FRAME_COUNT_EXTENDED})."
+                f"Payload needs {num_frames} frames which exceeds the 32-bit max frame count "
+                f"({MAX_FRAME_COUNT_EXTENDED})."
             )
         index_bits = EXTENDED_FRAME_INDEX_BITS
 

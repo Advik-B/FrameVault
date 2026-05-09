@@ -254,8 +254,12 @@ def decode(video_path: str, output_dir: str = "."):
                 qr_index_bits = qr_meta.get("index_bits")
                 if qr_index_bits in (DEFAULT_FRAME_INDEX_BITS, EXTENDED_FRAME_INDEX_BITS):
                     if qr_index_bits != index_bits:
+                        old_index_bits = index_bits
                         if frames or early_frames:
-                            print("  Warning: index width updated; discarding previously decoded frames.")
+                            print(
+                                "  Warning: index width changed from "
+                                f"{old_index_bits} to {qr_index_bits} bits; discarding previously decoded frames."
+                            )
                             frames = {}
                             early_frames = {}
                         index_bits = qr_index_bits
