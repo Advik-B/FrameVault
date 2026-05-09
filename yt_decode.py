@@ -9,10 +9,7 @@ import subprocess
 import numpy as np
 from pathlib import Path
 
-try:
-    import reedsolo
-except ImportError:
-    sys.exit("reedsolo not found. Run: pip install reedsolo")
+import reedsolo
 
 # Must match encoder exactly
 FRAME_WIDTH = 1920
