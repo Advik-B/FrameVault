@@ -98,9 +98,13 @@ def frame_layout(index_bits: int) -> tuple[int, int]:
     header_bits = SYNC_BITS + index_bits
     data_bits_per_frame = TOTAL_BLOCKS - header_bits
     if data_bits_per_frame <= 0:
-        raise ValueError("Frame index bits exceed available block capacity.")
+        raise ValueError(
+            f"Frame index bits ({index_bits}) exceed available block capacity ({TOTAL_BLOCKS} blocks)."
+        )
     if data_bits_per_frame % 8 != 0:
-        raise ValueError("Frame data bits must align to full bytes.")
+        raise ValueError(
+            f"Frame data bits ({data_bits_per_frame}) must align to full bytes (multiples of 8)."
+        )
     return header_bits, data_bits_per_frame
 
 
@@ -213,7 +217,9 @@ def encode(input_path: str, output_path: str):
         _, data_bits_per_frame = frame_layout(EXTENDED_FRAME_INDEX_BITS)
         num_frames = math.ceil(total_bits / data_bits_per_frame)
         if num_frames > MAX_FRAME_COUNT_EXTENDED:
-            raise ValueError("Payload exceeds maximum 32-bit frame index capacity.")
+            raise ValueError(
+                f"Payload needs {num_frames} frames which exceeds 32-bit limit ({MAX_FRAME_COUNT_EXTENDED})."
+            )
         index_bits = EXTENDED_FRAME_INDEX_BITS
 
     all_bits = np.unpackbits(np.frombuffer(ecc_data, dtype=np.uint8))

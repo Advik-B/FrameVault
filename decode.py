@@ -90,9 +90,13 @@ def frame_layout(index_bits: int) -> tuple[int, int]:
     header_bits = SYNC_BITS + index_bits
     data_bits_per_frame = TOTAL_BLOCKS - header_bits
     if data_bits_per_frame <= 0:
-        raise ValueError("Frame index bits exceed available block capacity.")
+        raise ValueError(
+            f"Frame index bits ({index_bits}) exceed available block capacity ({TOTAL_BLOCKS} blocks)."
+        )
     if data_bits_per_frame % 8 != 0:
-        raise ValueError("Frame data bits must align to full bytes.")
+        raise ValueError(
+            f"Frame data bits ({data_bits_per_frame}) must align to full bytes (multiples of 8)."
+        )
     return header_bits, data_bits_per_frame
 
 
@@ -251,6 +255,7 @@ def decode(video_path: str, output_dir: str = "."):
                 if qr_index_bits in (DEFAULT_FRAME_INDEX_BITS, EXTENDED_FRAME_INDEX_BITS):
                     if qr_index_bits != index_bits:
                         if frames or early_frames:
+                            print("  Warning: index width updated; discarding previously decoded frames.")
                             frames = {}
                             early_frames = {}
                         index_bits = qr_index_bits
