@@ -63,7 +63,7 @@ Each 1920×1080 frame contains a 30×16 grid of 64×64 pixel blocks:
 +--------+--------+--------+--------+--------+  ...  +--------+
 | SYNC 0 | SYNC 1 | SYNC 2 | SYNC 3 | SYNC 4 |       | SYNC 7 |  <- row 0, cols 0-7:  sync pattern
 +--------+--------+--------+--------+--------+       +--------+
-| IDX 0  | IDX 1  | IDX 2  |  ...                   | IDX 15 |  <- row 0, cols 8-23: frame index
+| IDX 0  | IDX 1  | IDX 2  |  ...                   | IDX 15 |  <- row 0, cols 8-23: frame index (16-bit default; 32-bit spans cols 8-39)
 +--------+--------+--------+                         +--------+
 | DATA   | DATA   | DATA   | DATA   | DATA   |  ...  | DATA   |  <- remaining 456 blocks: data
 +--------+--------+--------+--------+--------+       +--------+
@@ -72,12 +72,15 @@ Each 1920×1080 frame contains a 30×16 grid of 64×64 pixel blocks:
 ```
 
 - Sync pattern: `10101100` (8 bits, fixed). Used to validate frames and reject corrupted ones.
-- Frame index: 16-bit big-endian integer. Supports up to 65,535 frames (~36 minutes at 30fps).
-- Data: 456 bits = 57 bytes of Reed-Solomon encoded payload per frame.
+- Frame index: big-endian integer, 16-bit by default. Encoder switches to 32-bit when needed (hard limit).
+  When 32-bit is used, the index continues into the next blocks and data capacity per frame shrinks.
+- Data: 456 bits (16-bit index) or 440 bits (32-bit index) of Reed-Solomon encoded payload per frame.
 
 The first 1 second (`METADATA_DURATION_SEC`) in the video is reserved for QR metadata
 and does **not** contain data blocks. The decoder uses these frames to learn the
 expected ECC length, frame count, and SHA256 before assembling payload data.
+QR metadata also carries the frame index width (`i`) along with filename, size,
+ECC length, and metadata frame count.
 
 Each block is sampled at its center 32×32 region (the inner half, margin = 16px). Block edges are where DCT compression artifacts accumulate; the center is clean.
 
@@ -221,15 +224,15 @@ This tests the full encode/decode cycle locally. If this fails, the issue is in 
 | Frame dimensions | 1920 × 1080 |
 | Block size | 64 × 64 px |
 | Grid | 30 × 16 = 480 blocks/frame |
-| Header bits/frame | 24 (8 sync + 16 index) |
-| Data bits/frame | 456 |
-| Data bytes/frame | 57 |
-| Video data rate | 1,710 bytes/sec at 30fps |
+| Header bits/frame | 24 (8 sync + 16 index) / 40 (8 sync + 32 index) |
+| Data bits/frame | 456 (16-bit) / 440 (32-bit) |
+| Data bytes/frame | 57 (16-bit) / 55 (32-bit) |
+| Video data rate | 1,710 bytes/sec (16-bit) / 1,650 bytes/sec (32-bit) |
 | Audio data rate | 25 bytes/sec (4-FSK, 100 baud) |
 | ECC overhead | ~14% (RS-32 over GF(2^8)) |
-| Net video throughput | ~1,500 bytes/sec after ECC |
-| Max video duration | ~36 min (16-bit frame index) |
-| Max file size (video) | ~3.2 GB before ECC |
+| Net video throughput | ~1,500 bytes/sec (16-bit) / ~1,450 bytes/sec (32-bit) after ECC |
+| Max video duration | ~36 min (16-bit) / ~4.5 years (32-bit) |
+| Max file size (video) | Scales with index width (16-bit default, 32-bit hard limit) |
 
 Audio capacity is 1.5% of video capacity at these settings. For small files (under ~1.5 KB after ECC), audio covers 100% of the payload and provides full redundancy. For larger files it covers a prefix.
 
@@ -239,7 +242,7 @@ To increase audio coverage: raise `BAUD_RATE` in both scripts. 200 baud doubles 
 
 ## Known limitations
 
-**Frame index ceiling.** The 16-bit frame index supports 65,535 frames, which is ~36 minutes at 30fps and ~3.2 GB of raw file data after ECC. For larger files, increase `FRAME_INDEX_BITS` to 24 or 32 in both scripts and adjust `HEADER_BITS` and `DATA_BITS_PER_FRAME` accordingly.
+**Frame index ceiling.** The encoder uses 16-bit frame indices by default and automatically switches to 32-bit if the payload needs more than 16-bit indices. 32-bit is the hard limit.
 
 **YouTube re-encoding is untested.** The local round-trip works. YouTube's actual VP9/H.264 output has not yet been tested against this codec. The 64×64 block size was chosen conservatively for this reason. If YouTube's encoder corrupts blocks, the first thing to try is increasing `BLOCK_SIZE` to 128.
 
@@ -273,7 +276,7 @@ Payload layout (before ECC):
 +-------------------+---------------------------+-------------------+
 
 Metadata JSON fields:
-  v          encoding version (integer, currently 2)
+  v          encoding version (integer, currently 3)
   filename   original filename (string)
   size       original file size in bytes (integer)
   sha256     SHA256 hex digest of the original file bytes (string)

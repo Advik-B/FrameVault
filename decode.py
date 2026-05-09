@@ -25,10 +25,9 @@ ROWS = FRAME_HEIGHT // BLOCK_SIZE   # 16
 TOTAL_BLOCKS = COLS * ROWS          # 480
 
 SYNC_PATTERN = np.array([1, 0, 1, 0, 1, 1, 0, 0], dtype=np.uint8)
-FRAME_INDEX_BITS = 16
-HEADER_BITS = len(SYNC_PATTERN) + FRAME_INDEX_BITS  # 24
-DATA_BITS_PER_FRAME = TOTAL_BLOCKS - HEADER_BITS    # 456
-DATA_BYTES_PER_FRAME = DATA_BITS_PER_FRAME // 8     # 57
+SYNC_BITS = len(SYNC_PATTERN)
+DEFAULT_FRAME_INDEX_BITS = 16
+EXTENDED_FRAME_INDEX_BITS = 32
 
 SAMPLE_RATE = 44100
 BAUD_RATE = 100
@@ -87,18 +86,30 @@ def read_blocks(frame: np.ndarray) -> np.ndarray:
     return bits
 
 
-def decode_frame(bits: np.ndarray):
+def frame_layout(index_bits: int) -> tuple[int, int]:
+    header_bits = SYNC_BITS + index_bits
+    data_bits_per_frame = TOTAL_BLOCKS - header_bits
+    if data_bits_per_frame <= 0:
+        raise ValueError(
+            f"Frame index bits ({index_bits}) exceed available block capacity ({TOTAL_BLOCKS} blocks)."
+        )
+    if data_bits_per_frame % 8 != 0:
+        raise ValueError(
+            f"Frame data bits ({data_bits_per_frame}) must align to full bytes (multiples of 8)."
+        )
+    return header_bits, data_bits_per_frame
+
+
+def decode_frame(bits: np.ndarray, index_bits: int, header_bits: int):
     # Returns (frame_idx, data_bits) or (None, None) if sync check fails.
-    sync = bits[:len(SYNC_PATTERN)]
+    sync = bits[:SYNC_BITS]
     if not np.array_equal(sync, SYNC_PATTERN):
         return None, None
-    idx_bits = bits[len(SYNC_PATTERN):HEADER_BITS]
-    frame_idx = int(np.packbits(np.pad(idx_bits, (16 - FRAME_INDEX_BITS, 0)))[1])
-    # Cleaner index decode:
+    idx_bits = bits[SYNC_BITS:header_bits]
     frame_idx = 0
     for b in idx_bits:
         frame_idx = (frame_idx << 1) | int(b)
-    data_bits = bits[HEADER_BITS:]
+    data_bits = bits[header_bits:]
     return frame_idx, data_bits
 
 
@@ -193,6 +204,7 @@ def normalize_qr_meta(raw: dict) -> dict:
         "sha256": raw.get("h") if "h" in raw else raw.get("sha256"),
         "ecc_bytes": to_int(raw.get("e") if "e" in raw else raw.get("ecc_bytes")),
         "frames": to_int(raw.get("n") if "n" in raw else raw.get("frames")),
+        "index_bits": to_int(raw.get("i") if "i" in raw else raw.get("index_bits")),
         "metadata_frames": to_int(raw.get("m") if "m" in raw else raw.get("metadata_frames")),
     }
 
@@ -223,6 +235,9 @@ def decode(video_path: str, output_dir: str = "."):
 
     # Step 1: video channel
     print("\n[1/5] Decoding video channel...")
+    index_bits = DEFAULT_FRAME_INDEX_BITS
+    header_bits, data_bits_per_frame = frame_layout(index_bits)
+    data_bytes_per_frame = data_bits_per_frame // 8
     frames = {}
     total = 0
     sync_fail = 0
@@ -236,8 +251,28 @@ def decode(video_path: str, output_dir: str = "."):
             qr_meta = decode_qr_metadata(frame_np, qr_detector)
             if qr_meta:
                 print(f"  QR metadata decoded from frame {total}.")
+                qr_index_bits = qr_meta.get("index_bits")
+                if qr_index_bits is not None:
+                    if qr_index_bits not in (DEFAULT_FRAME_INDEX_BITS, EXTENDED_FRAME_INDEX_BITS):
+                        print(
+                            f"  Warning: unsupported index width {qr_index_bits}; falling back to "
+                            f"{index_bits}-bit decoding (may fail)."
+                        )
+                    elif qr_index_bits != index_bits:
+                        old_index_bits = index_bits
+                        if frames or early_frames:
+                            print(
+                                f"  Warning: unexpected index width change from {old_index_bits} to "
+                                f"{qr_index_bits} bits; this may indicate corrupted or mixed sources. "
+                                "Discarding previously decoded frames."
+                            )
+                            frames = {}
+                            early_frames = {}
+                        index_bits = qr_index_bits
+                        header_bits, data_bits_per_frame = frame_layout(index_bits)
+                        data_bytes_per_frame = data_bits_per_frame // 8
         bits = read_blocks(frame_np)
-        idx, data_bits = decode_frame(bits)
+        idx, data_bits = decode_frame(bits, index_bits, header_bits)
         if idx is None:
             sync_fail += 1
         else:
@@ -270,19 +305,19 @@ def decode(video_path: str, output_dir: str = "."):
     else:
         frame_count = max(frames.keys()) + 1
 
-    total_bits = frame_count * DATA_BITS_PER_FRAME
+    total_bits = frame_count * data_bits_per_frame
     all_bits = np.zeros(total_bits, dtype=np.uint8)
     missing = []
 
     for i in range(frame_count):
         if i in frames:
-            all_bits[i * DATA_BITS_PER_FRAME:(i + 1) * DATA_BITS_PER_FRAME] = frames[i]
+            all_bits[i * data_bits_per_frame:(i + 1) * data_bits_per_frame] = frames[i]
         else:
             missing.append(i)
 
     if missing:
         print(f"  Missing {len(missing)} frames: {missing[:10]}{'...' if len(missing)>10 else ''}")
-        print(f"  Reed-Solomon will attempt recovery ({len(missing)*DATA_BYTES_PER_FRAME} bytes zeroed).")
+        print(f"  Reed-Solomon will attempt recovery ({len(missing)*data_bytes_per_frame} bytes zeroed).")
     else:
         print(f"  All {frame_count} frames present.")
 
@@ -314,9 +349,9 @@ def decode(video_path: str, output_dir: str = "."):
     if expected_ecc_bytes is None and len(ecc_video) >= rs_block_size:
         ecc_video = ecc_video[: (len(ecc_video) // rs_block_size) * rs_block_size]
     missing_byte_positions = [
-        i * DATA_BYTES_PER_FRAME + j
+        i * data_bytes_per_frame + j
         for i in missing
-        for j in range(DATA_BYTES_PER_FRAME)
+        for j in range(data_bytes_per_frame)
     ]
     erasures_video = [pos for pos in missing_byte_positions if pos < len(ecc_video)]
 

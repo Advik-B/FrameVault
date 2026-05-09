@@ -4,6 +4,7 @@ import sys
 import os
 import json
 import hashlib
+import math
 import struct
 import subprocess
 import tempfile
@@ -23,11 +24,14 @@ COLS = FRAME_WIDTH // BLOCK_SIZE    # 30
 ROWS = FRAME_HEIGHT // BLOCK_SIZE   # 16
 TOTAL_BLOCKS = COLS * ROWS          # 480
 
-# Frame layout: [8 sync bits][16 index bits][456 data bits]
+# Frame layout: [8 sync bits][frame index bits][data bits]
 SYNC_PATTERN = np.array([1, 0, 1, 0, 1, 1, 0, 0], dtype=np.uint8)
-FRAME_INDEX_BITS = 16               # max 65535 frames (~36 min at 30fps)
-HEADER_BITS = len(SYNC_PATTERN) + FRAME_INDEX_BITS  # 24
-DATA_BITS_PER_FRAME = TOTAL_BLOCKS - HEADER_BITS    # 456 bits = 57 bytes/frame
+SYNC_BITS = len(SYNC_PATTERN)
+DEFAULT_FRAME_INDEX_BITS = 16
+EXTENDED_FRAME_INDEX_BITS = 32
+MAX_FRAME_INDEX = (1 << EXTENDED_FRAME_INDEX_BITS) - 1
+MAX_FRAME_COUNT_DEFAULT = 1 << DEFAULT_FRAME_INDEX_BITS
+MAX_FRAME_COUNT_EXTENDED = MAX_FRAME_INDEX + 1
 
 # Audio (4-FSK)
 SAMPLE_RATE = 44100
@@ -47,7 +51,7 @@ QR_BORDER_MODULES = 4
 QR_ERROR_CORRECTION = qrcode.constants.ERROR_CORRECT_Q
 QR_MIN_MODULE_PX = 6
 
-ENCODING_VERSION = 2
+ENCODING_VERSION = 3
 
 
 def build_payload(filepath: str):
@@ -66,7 +70,7 @@ def build_payload(filepath: str):
     return payload, meta
 
 
-def build_qr_metadata(meta: dict, ecc_len: int, num_frames: int) -> bytes:
+def build_qr_metadata(meta: dict, ecc_len: int, num_frames: int, index_bits: int) -> bytes:
     qr_meta = {
         "v": ENCODING_VERSION,
         "f": meta["filename"],
@@ -74,6 +78,7 @@ def build_qr_metadata(meta: dict, ecc_len: int, num_frames: int) -> bytes:
         "h": meta["sha256"],
         "e": ecc_len,
         "n": num_frames,
+        "i": index_bits,
         "m": METADATA_FRAMES,
     }
     return json.dumps(qr_meta, separators=(",", ":")).encode()
@@ -89,15 +94,33 @@ def ecc_encode(data: bytes) -> bytes:
     return encoded
 
 
-def index_to_bits(idx: int) -> np.ndarray:
+def frame_layout(index_bits: int) -> tuple[int, int]:
+    header_bits = SYNC_BITS + index_bits
+    data_bits_per_frame = TOTAL_BLOCKS - header_bits
+    if data_bits_per_frame <= 0:
+        raise ValueError(
+            f"Frame index bits ({index_bits}) exceed available block capacity ({TOTAL_BLOCKS} blocks)."
+        )
+    if data_bits_per_frame % 8 != 0:
+        raise ValueError(
+            f"Frame data bits ({data_bits_per_frame}) must align to full bytes (multiples of 8)."
+        )
+    return header_bits, data_bits_per_frame
+
+
+def frames_needed(total_bits: int, data_bits_per_frame: int) -> int:
+    return math.ceil(total_bits / data_bits_per_frame)
+
+
+def index_to_bits(idx: int, index_bits: int) -> np.ndarray:
     return np.array(
-        [(idx >> (FRAME_INDEX_BITS - 1 - i)) & 1 for i in range(FRAME_INDEX_BITS)],
+        [(idx >> (index_bits - 1 - i)) & 1 for i in range(index_bits)],
         dtype=np.uint8
     )
 
 
-def make_frame(frame_idx: int, data_bits: np.ndarray) -> bytes:
-    header = np.concatenate([SYNC_PATTERN, index_to_bits(frame_idx)])
+def make_frame(frame_idx: int, data_bits: np.ndarray, index_bits: int) -> bytes:
+    header = np.concatenate([SYNC_PATTERN, index_to_bits(frame_idx, index_bits)])
     block_bits = np.concatenate([header, data_bits])            # (480,)
     grid = (block_bits.reshape(ROWS, COLS) * 255).astype(np.uint8)  # (16, 30)
     frame_2d = np.repeat(np.repeat(grid, BLOCK_SIZE, axis=0), BLOCK_SIZE, axis=1)  # (1080, 1920)
@@ -187,18 +210,35 @@ def encode(input_path: str, output_path: str):
     print("\n[2/5] Reed-Solomon ECC...")
     ecc_data = ecc_encode(payload)
 
-    all_bits = np.unpackbits(np.frombuffer(ecc_data, dtype=np.uint8))
-    rem = len(all_bits) % DATA_BITS_PER_FRAME
-    if rem:
-        all_bits = np.concatenate([all_bits, np.zeros(DATA_BITS_PER_FRAME - rem, dtype=np.uint8)])
+    total_bits = len(ecc_data) * 8
+    _, data_bits_default = frame_layout(DEFAULT_FRAME_INDEX_BITS)
+    frames_16 = frames_needed(total_bits, data_bits_default)
+    if frames_16 <= MAX_FRAME_COUNT_DEFAULT:
+        index_bits = DEFAULT_FRAME_INDEX_BITS
+        data_bits_per_frame = data_bits_default
+        num_frames = frames_16
+    else:
+        _, data_bits_per_frame = frame_layout(EXTENDED_FRAME_INDEX_BITS)
+        num_frames = frames_needed(total_bits, data_bits_per_frame)
+        if num_frames > MAX_FRAME_COUNT_EXTENDED:
+            raise ValueError(
+                f"Payload needs {num_frames} frames which exceeds 32-bit frame index capacity "
+                f"(max frame count {MAX_FRAME_COUNT_EXTENDED})."
+            )
+        index_bits = EXTENDED_FRAME_INDEX_BITS
 
-    num_frames = len(all_bits) // DATA_BITS_PER_FRAME
-    qr_payload = build_qr_metadata(meta, len(ecc_data), num_frames)
+    all_bits = np.unpackbits(np.frombuffer(ecc_data, dtype=np.uint8))
+    rem = len(all_bits) % data_bits_per_frame
+    if rem:
+        all_bits = np.concatenate([all_bits, np.zeros(data_bits_per_frame - rem, dtype=np.uint8)])
+
+    num_frames = len(all_bits) // data_bits_per_frame
+    qr_payload = build_qr_metadata(meta, len(ecc_data), num_frames, index_bits)
     qr_frame = make_qr_frame(qr_payload)
     total_frames = num_frames + METADATA_FRAMES
     duration_sec = total_frames / FRAME_RATE
 
-    video_bps = DATA_BITS_PER_FRAME * FRAME_RATE // 8
+    video_bps = (data_bits_per_frame * FRAME_RATE) // 8
     audio_byte_count = min(len(ecc_data), int(duration_sec * BYTES_PER_SEC_AUDIO))
     audio_coverage_pct = audio_byte_count / len(ecc_data) * 100
 
@@ -206,7 +246,8 @@ def encode(input_path: str, output_path: str):
     print(f"      Metadata frames:{METADATA_FRAMES:>10} ({METADATA_DURATION_SEC:.1f}s)")
     print(f"      Data frames:    {num_frames:>10}")
     print(f"      Total frames:   {total_frames:>10} @ {FRAME_RATE}fps ({duration_sec:.1f}s)")
-    print(f"      Video channel:  {video_bps:,} bytes/sec ({DATA_BITS_PER_FRAME} bits/frame)")
+    print(f"      Frame index:    {index_bits} bits")
+    print(f"      Video channel:  {video_bps:,} bytes/sec ({data_bits_per_frame} bits/frame)")
     print(f"      Audio channel:  {BYTES_PER_SEC_AUDIO} bytes/sec (4-FSK @ {BAUD_RATE} baud)")
     print(f"      Audio covers:   {audio_byte_count:,}/{len(ecc_data):,} bytes ({audio_coverage_pct:.1f}%)")
     if audio_coverage_pct < 100:
@@ -251,8 +292,8 @@ def encode(input_path: str, output_path: str):
 
         written = METADATA_FRAMES
         for i in range(num_frames):
-            chunk = all_bits[i * DATA_BITS_PER_FRAME:(i + 1) * DATA_BITS_PER_FRAME]
-            proc.stdin.write(make_frame(i, chunk))
+            chunk = all_bits[i * data_bits_per_frame:(i + 1) * data_bits_per_frame]
+            proc.stdin.write(make_frame(i, chunk, index_bits))
             written += 1
             if written % 30 == 0 or written == total_frames:
                 pct = written / total_frames * 100
