@@ -254,7 +254,10 @@ def decode(video_path: str, output_dir: str = "."):
                 qr_index_bits = qr_meta.get("index_bits")
                 if qr_index_bits is not None:
                     if qr_index_bits not in (DEFAULT_FRAME_INDEX_BITS, EXTENDED_FRAME_INDEX_BITS):
-                        print(f"  Warning: unsupported index width {qr_index_bits}; using {index_bits}-bit.")
+                        print(
+                            f"  Warning: unsupported index width {qr_index_bits}; falling back to "
+                            f"{index_bits}-bit decoding (may fail)."
+                        )
                     elif qr_index_bits != index_bits:
                         old_index_bits = index_bits
                         if frames or early_frames:

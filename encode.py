@@ -108,6 +108,10 @@ def frame_layout(index_bits: int) -> tuple[int, int]:
     return header_bits, data_bits_per_frame
 
 
+def frames_needed(total_bits: int, data_bits_per_frame: int) -> int:
+    return math.ceil(total_bits / data_bits_per_frame)
+
+
 def index_to_bits(idx: int, index_bits: int) -> np.ndarray:
     return np.array(
         [(idx >> (index_bits - 1 - i)) & 1 for i in range(index_bits)],
@@ -208,14 +212,14 @@ def encode(input_path: str, output_path: str):
 
     total_bits = len(ecc_data) * 8
     _, data_bits_default = frame_layout(DEFAULT_FRAME_INDEX_BITS)
-    frames_16 = math.ceil(total_bits / data_bits_default)
+    frames_16 = frames_needed(total_bits, data_bits_default)
     if frames_16 <= MAX_FRAME_COUNT_DEFAULT:
         index_bits = DEFAULT_FRAME_INDEX_BITS
         data_bits_per_frame = data_bits_default
         num_frames = frames_16
     else:
         _, data_bits_per_frame = frame_layout(EXTENDED_FRAME_INDEX_BITS)
-        num_frames = math.ceil(total_bits / data_bits_per_frame)
+        num_frames = frames_needed(total_bits, data_bits_per_frame)
         if num_frames > MAX_FRAME_COUNT_EXTENDED:
             raise ValueError(
                 f"Payload needs {num_frames} frames which exceeds 32-bit frame index capacity "
