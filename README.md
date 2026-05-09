@@ -36,6 +36,9 @@ input file
     v
 [Reed-Solomon ECC]  +14% overhead, 32 ECC symbols per 255-byte block
     |
+    v
+[QR metadata frames]  <-- first N frames (QR metadata for decoder)
+    |
     +---------------------------+
     |                           |
     v                           v
@@ -72,6 +75,10 @@ Each 1920×1080 frame contains a 30×16 grid of 64×64 pixel blocks:
 - Frame index: 16-bit big-endian integer. Supports up to 65,535 frames (~36 minutes at 30fps).
 - Data: 456 bits = 57 bytes of Reed-Solomon encoded payload per frame.
 
+The first `METADATA_FRAMES` in the video are reserved for QR metadata and do **not**
+contain data blocks. The decoder uses these frames to learn the expected ECC length,
+frame count, and SHA256 before assembling payload data.
+
 Each block is sampled at its center 32×32 region (the inner half, margin = 16px). Block edges are where DCT compression artifacts accumulate; the center is clean.
 
 ### Audio channel
@@ -101,12 +108,20 @@ ffmpeg pipe               ffmpeg PCM pipe
 rgb24 raw frames          44100Hz s16le mono
     |                           |
     v                           v
-center-sample             batch FFT per
-each 64x64 block          441-sample window
-threshold at 128          argmax over
-    |                     4 target bins
-    v                           |
-sync check                      v
+decode QR metadata        batch FFT per
+from first N frames       441-sample window
+    |                           |
+    v                           v
+expected length           argmax over
+frames + SHA256           4 target bins
+    |
+    v
+center-sample
+each 64x64 block
+threshold at 128
+    |
+    v
+sync check
 frame index                 bit stream
     |                           |
     v                           v
@@ -150,7 +165,7 @@ A byte corrupted in the video channel has no correlation with whether the same b
 - yt-dlp (for downloading encoded videos back from YouTube)
 
 ```
-pip install reedsolo numpy
+pip install reedsolo numpy qrcode opencv-python-headless
 ```
 
 ---
@@ -258,13 +273,29 @@ Payload layout (before ECC):
 +-------------------+---------------------------+-------------------+
 
 Metadata JSON fields:
-  v          encoding version (integer, currently 1)
+  v          encoding version (integer, currently 2)
   filename   original filename (string)
   size       original file size in bytes (integer)
   sha256     SHA256 hex digest of the original file bytes (string)
 ```
 
 The RS-encoded payload is then split into 456-bit chunks, one chunk per video frame. The audio channel carries the RS-encoded bytes (not the raw payload) starting from byte 0.
+
+## QR metadata (first N frames)
+
+The first `METADATA_FRAMES` are QR codes that carry compact metadata for the decoder:
+
+```
+{
+  "v": 2,              // encoding version
+  "f": "file.bin",     // filename
+  "s": 12345,          // size in bytes
+  "h": "sha256...",    // SHA256 hex
+  "e": 67890,          // ECC stream length in bytes
+  "n": 42,             // data frame count
+  "m": 5               // metadata frame count
+}
+```
 
 ---
 

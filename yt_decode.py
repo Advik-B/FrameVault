@@ -10,6 +10,10 @@ import numpy as np
 from pathlib import Path
 
 import reedsolo
+try:
+    import cv2
+except ImportError:  # pragma: no cover - optional for older videos
+    cv2 = None
 
 # Must match encoder exactly
 FRAME_WIDTH = 1920
@@ -33,6 +37,9 @@ SAMPLES_PER_SYMBOL = SAMPLE_RATE // BAUD_RATE       # 441
 FSK_FREQS = [1000, 1200, 1400, 1600]
 
 RS_ECC_SYMBOLS = 32
+
+# Metadata QR
+METADATA_FRAMES = 5
 
 # How many pixels in from each block edge to sample.
 # Block edges are where DCT compression artifacts cluster.
@@ -116,6 +123,8 @@ def decode_fsk(samples: np.ndarray) -> bytes:
 
     # Batch FFT across all symbol windows at once
     windows = samples[:n_symbols * SAMPLES_PER_SYMBOL].reshape(n_symbols, SAMPLES_PER_SYMBOL)
+    window = np.hanning(SAMPLES_PER_SYMBOL).astype(np.float32)
+    windows = windows * window
     fft_mags = np.abs(np.fft.rfft(windows, axis=1))  # (n_symbols, freq_bins)
 
     freq_axis = np.fft.rfftfreq(SAMPLES_PER_SYMBOL, 1.0 / SAMPLE_RATE)
@@ -132,23 +141,80 @@ def decode_fsk(samples: np.ndarray) -> bytes:
     return np.packbits(bits[:n_bytes * 8]).tobytes()
 
 
-def rs_decode(data: bytes) -> bytes:
+def rs_decode(data: bytes, erasures: list[int] | None = None) -> bytes:
     rs = reedsolo.RSCodec(RS_ECC_SYMBOLS)
-    decoded, _, _ = rs.decode(data)
-    return bytes(decoded)
+    rs_block_size = 255
+    decoded_blocks = []
+    for block_start in range(0, len(data), rs_block_size):
+        block = data[block_start:block_start + rs_block_size]
+        if not block:
+            break
+        if erasures:
+            block_erasures = [
+                pos - block_start
+                for pos in erasures
+                if block_start <= pos < block_start + rs_block_size
+            ]
+        else:
+            block_erasures = None
+        if block_erasures:
+            decoded, _, _ = rs.decode(block, erase_pos=block_erasures)
+        else:
+            decoded, _, _ = rs.decode(block)
+        decoded_blocks.append(decoded)
+    return b"".join(bytes(block) for block in decoded_blocks)
 
 
-def parse_payload(payload: bytes):
+def parse_payload(payload: bytes, expected_size: int | None = None):
     meta_len = struct.unpack(">I", payload[:4])[0]
     meta = json.loads(payload[4:4 + meta_len])
     file_start = 4 + meta_len
-    file_data = payload[file_start:file_start + meta["size"]]
+    file_size = expected_size if expected_size is not None else meta["size"]
+    file_data = payload[file_start:file_start + file_size]
+    if len(file_data) < file_size:
+        raise ValueError("Payload ended before expected file size.")
     return meta, file_data
 
 
 def bits_to_bytes(bits: np.ndarray) -> bytes:
     n = (len(bits) // 8) * 8
     return np.packbits(bits[:n]).tobytes()
+
+
+def normalize_qr_meta(raw: dict) -> dict:
+    def to_int(value):
+        return int(value) if value is not None else None
+
+    return {
+        "version": to_int(raw.get("v")),
+        "filename": raw.get("f") if "f" in raw else raw.get("filename"),
+        "size": to_int(raw.get("s") if "s" in raw else raw.get("size")),
+        "sha256": raw.get("h") if "h" in raw else raw.get("sha256"),
+        "ecc_bytes": to_int(raw.get("e") if "e" in raw else raw.get("ecc_bytes")),
+        "frames": to_int(raw.get("n") if "n" in raw else raw.get("frames")),
+        "metadata_frames": to_int(raw.get("m") if "m" in raw else raw.get("metadata_frames")),
+    }
+
+
+def decode_qr_metadata(frame: np.ndarray, detector) -> dict | None:
+    if detector is None:
+        return None
+    bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+    data, _, _ = detector.detectAndDecode(bgr)
+    if not data:
+        gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+        _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        data, _, _ = detector.detectAndDecode(binary)
+    if not data:
+        return None
+    try:
+        raw = json.loads(data)
+    except json.JSONDecodeError:
+        return None
+    meta = normalize_qr_meta(raw)
+    if meta["filename"] is not None and meta["size"] is not None and meta["sha256"] is not None:
+        return meta
+    return None
 
 
 def decode(video_path: str, output_dir: str = "."):
@@ -159,32 +225,55 @@ def decode(video_path: str, output_dir: str = "."):
     frames = {}
     total = 0
     sync_fail = 0
+    qr_meta = None
+    qr_detector = cv2.QRCodeDetector() if cv2 is not None else None
+    early_frames = {}
 
     for frame_np in stream_frames(video_path):
         total += 1
+        if total <= METADATA_FRAMES and qr_meta is None:
+            qr_meta = decode_qr_metadata(frame_np, qr_detector)
+            if qr_meta:
+                print(f"  QR metadata decoded from frame {total}.")
         bits = read_blocks(frame_np)
         idx, data_bits = decode_frame(bits)
         if idx is None:
             sync_fail += 1
         else:
-            frames[idx] = data_bits
+            if total <= METADATA_FRAMES and qr_meta is None:
+                early_frames[idx] = data_bits
+            else:
+                frames[idx] = data_bits
         if total % 30 == 0:
             print(f"  {total} frames read, {len(frames)} valid, {sync_fail} sync failures", end="\r", flush=True)
 
     print()
     print(f"  Total: {total} | Valid: {len(frames)} | Sync failures: {sync_fail}")
+    if qr_meta is None:
+        frames.update({idx: bits for idx, bits in early_frames.items() if idx not in frames})
+        print("  QR metadata not found; falling back to payload header.")
+    else:
+        if qr_meta.get("metadata_frames") not in (None, METADATA_FRAMES):
+            print(f"  QR metadata expects {qr_meta['metadata_frames']} metadata frames.")
 
     if not frames:
         sys.exit("No valid frames found. Check that the video is 1080p and was encoded with yt_encode.py.")
 
     # Step 2: reassemble video bits
     print(f"\n[2/5] Reassembling frame data...")
-    max_idx = max(frames.keys())
-    total_bits = (max_idx + 1) * DATA_BITS_PER_FRAME
+    expected_frames = qr_meta.get("frames") if qr_meta else None
+    expected_ecc_bytes = qr_meta.get("ecc_bytes") if qr_meta else None
+    if expected_frames is not None:
+        frames = {idx: bits for idx, bits in frames.items() if idx < expected_frames}
+        frame_count = expected_frames
+    else:
+        frame_count = max(frames.keys()) + 1
+
+    total_bits = frame_count * DATA_BITS_PER_FRAME
     all_bits = np.zeros(total_bits, dtype=np.uint8)
     missing = []
 
-    for i in range(max_idx + 1):
+    for i in range(frame_count):
         if i in frames:
             all_bits[i * DATA_BITS_PER_FRAME:(i + 1) * DATA_BITS_PER_FRAME] = frames[i]
         else:
@@ -194,34 +283,48 @@ def decode(video_path: str, output_dir: str = "."):
         print(f"  Missing {len(missing)} frames: {missing[:10]}{'...' if len(missing)>10 else ''}")
         print(f"  Reed-Solomon will attempt recovery ({len(missing)*DATA_BYTES_PER_FRAME} bytes zeroed).")
     else:
-        print(f"  All {max_idx+1} frames present.")
+        print(f"  All {frame_count} frames present.")
 
     ecc_from_video = bits_to_bytes(all_bits)
+    if expected_ecc_bytes:
+        if expected_ecc_bytes <= len(ecc_from_video):
+            ecc_from_video = ecc_from_video[:expected_ecc_bytes]
+        else:
+            print(f"  Warning: QR expects {expected_ecc_bytes:,} bytes, but only {len(ecc_from_video):,} available.")
     print(f"  Video ECC stream: {len(ecc_from_video):,} bytes")
 
     # Step 3: audio channel
     print(f"\n[3/5] Decoding audio channel (4-FSK @ {BAUD_RATE} baud)...")
     audio_samples = extract_audio(video_path)
     audio_bytes = decode_fsk(audio_samples)
-    coverage_pct = len(audio_bytes) / len(ecc_from_video) * 100 if ecc_from_video else 0
+    ecc_len_for_coverage = len(ecc_from_video) if ecc_from_video else 0
+    coverage_pct = len(audio_bytes) / ecc_len_for_coverage * 100 if ecc_len_for_coverage else 0
     print(f"  Recovered: {len(audio_bytes):,} bytes ({coverage_pct:.1f}% of ECC stream)")
 
     # Step 4: RS decode — try strategies in order of confidence
     print(f"\n[4/5] Reed-Solomon decode...")
     payload = None
 
-    # Each RS block is exactly 255 bytes. The video stream may have up to 56 bytes of
-    # trailing zero-padding from frame alignment. Truncating to the nearest 255-byte
-    # boundary strips that garbage without touching any real ECC data.
+    # Each RS block is at most 255 bytes. The final block may be shorter.
+    # If QR metadata isn't available, trimming to full blocks can avoid
+    # trailing frame padding, but keep short payloads intact.
     rs_block_size = 255
-    ecc_video = ecc_from_video[: (len(ecc_from_video) // rs_block_size) * rs_block_size]
+    ecc_video = ecc_from_video
+    if expected_ecc_bytes is None and len(ecc_video) >= rs_block_size:
+        ecc_video = ecc_video[: (len(ecc_video) // rs_block_size) * rs_block_size]
+    missing_byte_positions = [
+        i * DATA_BYTES_PER_FRAME + j
+        for i in missing
+        for j in range(DATA_BYTES_PER_FRAME)
+    ]
+    erasures_video = [pos for pos in missing_byte_positions if pos < len(ecc_video)]
 
     # Strategy A: video only — best for local lossless files where video is perfect
     # but audio (AAC→FSK) is noisy. Trying this first avoids overwriting correct
     # video bytes with noisy audio bytes.
     print(f"  Trying video-only ({len(ecc_video):,} bytes)...")
     try:
-        payload = rs_decode(ecc_video)
+        payload = rs_decode(ecc_video, erasures=erasures_video if erasures_video else None)
         print(f"  RS decode succeeded on video stream.")
     except reedsolo.ReedSolomonError as e:
         print(f"  Video-only RS failed: {e}")
@@ -234,9 +337,10 @@ def decode(video_path: str, output_dir: str = "."):
         merged = bytearray(ecc_video)
         for i in range(min(len(audio_bytes), len(merged))):
             merged[i] = audio_bytes[i]
+        erasures_merged = [pos for pos in erasures_video if pos >= len(audio_bytes)] if erasures_video else None
         print(f"  Trying merged (audio+video)...")
         try:
-            payload = rs_decode(bytes(merged))
+            payload = rs_decode(bytes(merged), erasures=erasures_merged)
             print(f"  RS decode succeeded on merged stream.")
         except reedsolo.ReedSolomonError as e:
             print(f"  Merged RS failed: {e}")
@@ -264,16 +368,29 @@ def decode(video_path: str, output_dir: str = "."):
 
     # Step 5: extract file
     print(f"\n[5/5] Extracting file from payload ({len(payload):,} bytes)...")
-    meta, file_data = parse_payload(payload)
+    expected_size = qr_meta["size"] if qr_meta else None
+    expected_sha = qr_meta["sha256"] if qr_meta else None
+    expected_filename = qr_meta["filename"] if qr_meta else None
+    meta, file_data = parse_payload(payload, expected_size=expected_size)
 
     sha256_computed = hashlib.sha256(file_data).hexdigest()
-    sha256_match = sha256_computed == meta["sha256"]
+    sha256_expected = expected_sha or meta["sha256"]
+    sha256_match = sha256_computed == sha256_expected
 
-    out_path = os.path.join(output_dir, meta["filename"])
+    out_name = expected_filename or meta["filename"]
+    out_path = os.path.join(output_dir, out_name)
     Path(out_path).write_bytes(file_data)
 
-    print(f"\n  Filename:  {meta['filename']}")
-    print(f"  Size:      {len(file_data):,} bytes (expected {meta['size']:,})")
+    if qr_meta and (
+        meta.get("filename") != expected_filename
+        or meta.get("size") != expected_size
+        or meta.get("sha256") != expected_sha
+    ):
+        print("  Warning: payload metadata differs from QR metadata.")
+
+    print(f"\n  Filename:  {out_name}")
+    expected_size_display = expected_size if expected_size is not None else meta["size"]
+    print(f"  Size:      {len(file_data):,} bytes (expected {expected_size_display:,})")
     print(f"  SHA256:    {sha256_computed}")
     print(f"  Integrity: {'PASS' if sha256_match else 'FAIL - data is corrupted'}")
     print(f"  Saved to:  {out_path}")
