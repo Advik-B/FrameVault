@@ -207,11 +207,11 @@ def encode(input_path: str, output_path: str):
     ecc_data = ecc_encode(payload)
 
     total_bits = len(ecc_data) * 8
-    _, data_bits_16 = frame_layout(DEFAULT_FRAME_INDEX_BITS)
-    frames_16 = math.ceil(total_bits / data_bits_16)
+    _, data_bits_default = frame_layout(DEFAULT_FRAME_INDEX_BITS)
+    frames_16 = math.ceil(total_bits / data_bits_default)
     if frames_16 <= MAX_FRAME_COUNT_DEFAULT:
         index_bits = DEFAULT_FRAME_INDEX_BITS
-        data_bits_per_frame = data_bits_16
+        data_bits_per_frame = data_bits_default
         num_frames = frames_16
     else:
         _, data_bits_per_frame = frame_layout(EXTENDED_FRAME_INDEX_BITS)

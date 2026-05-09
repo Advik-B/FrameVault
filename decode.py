@@ -257,8 +257,9 @@ def decode(video_path: str, output_dir: str = "."):
                         old_index_bits = index_bits
                         if frames or early_frames:
                             print(
-                                "  Warning: index width changed from "
-                                f"{old_index_bits} to {qr_index_bits} bits; discarding previously decoded frames."
+                                "  Warning: unexpected index width change from "
+                                f"{old_index_bits} to {qr_index_bits} bits; this may indicate corrupted "
+                                "or mixed sources. Discarding previously decoded frames."
                             )
                             frames = {}
                             early_frames = {}

@@ -63,7 +63,7 @@ Each 1920×1080 frame contains a 30×16 grid of 64×64 pixel blocks:
 +--------+--------+--------+--------+--------+  ...  +--------+
 | SYNC 0 | SYNC 1 | SYNC 2 | SYNC 3 | SYNC 4 |       | SYNC 7 |  <- row 0, cols 0-7:  sync pattern
 +--------+--------+--------+--------+--------+       +--------+
-| IDX 0  | IDX 1  | IDX 2  |  ...                   | IDX 15 |  <- row 0, cols 8-23: frame index (16-bit default)
+| IDX 0  | IDX 1  | IDX 2  |  ...                   | IDX 15 |  <- row 0, cols 8-23: frame index (16-bit default; 32-bit continues)
 +--------+--------+--------+                         +--------+
 | DATA   | DATA   | DATA   | DATA   | DATA   |  ...  | DATA   |  <- remaining 456 blocks: data
 +--------+--------+--------+--------+--------+       +--------+
@@ -74,7 +74,7 @@ Each 1920×1080 frame contains a 30×16 grid of 64×64 pixel blocks:
 - Sync pattern: `10101100` (8 bits, fixed). Used to validate frames and reject corrupted ones.
 - Frame index: big-endian integer, 16-bit by default. Encoder switches to 32-bit when needed (hard limit).
   When 32-bit is used, the index continues into the next blocks and data capacity per frame shrinks.
-- Data: 456 bits = 57 bytes of Reed-Solomon encoded payload per frame.
+- Data: 456 bits (16-bit index) or 440 bits (32-bit index) of Reed-Solomon encoded payload per frame.
 
 The first 1 second (`METADATA_DURATION_SEC`) in the video is reserved for QR metadata
 and does **not** contain data blocks. The decoder uses these frames to learn the
