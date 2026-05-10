@@ -96,7 +96,7 @@ Frequencies:     1000 Hz = 00
                  1600 Hz = 11
 ```
 
-Tones are generated in batch via vectorized numpy, one symbol per 441 samples at 44100 Hz. The audio carries as many bytes of the ECC stream as the video duration allows, starting from byte 0. For small files this covers the entire payload; for large files it covers a prefix that provides a second decode path if video frames fail.
+Tones are generated in batch via vectorized numpy, one symbol per 441 samples at 44100 Hz. The audio carries as many ECC bytes as the video duration allows. Positions are selected using the **distributed** layout: the audio bytes are spaced evenly across the *entire* ECC stream (position 0 through ecc\_len−1) rather than covering only the prefix. This means every audio byte contributes error-correction signal at a different part of the file, giving the decoder useful recovery leverage across the full archive regardless of which region the video channel corrupts.
 
 ### Decoding pipeline
 
@@ -135,9 +135,9 @@ fill gaps with 0s
                 |
                 v
         [merge strategies]
-        1. merged  (audio overrides first N bytes; independent error profiles)
-        2. video-only
-        3. audio-only
+        1. video-only  (tried first; fastest path for clean local files)
+        2. merged      (audio global parity merged at planned ECC positions)
+        3. audio-only  (fallback; only useful if audio covers the whole ECC stream)
                 |
                 v
         [Reed-Solomon decode]
@@ -234,9 +234,47 @@ This tests the full encode/decode cycle locally. If this fails, the issue is in 
 | Max video duration | ~36 min (16-bit) / ~4.5 years (32-bit) |
 | Max file size (video) | Scales with index width (16-bit default, 32-bit hard limit) |
 
-Audio capacity is 1.5% of video capacity at these settings. For small files (under ~1.5 KB after ECC), audio covers 100% of the payload and provides full redundancy. For larger files, the encoder now distributes those audio bytes across the entire ECC stream instead of only protecting the prefix.
+Audio capacity is ~1.5% of video capacity at these settings. Audio bytes are sampled from evenly-spaced positions across the **entire** ECC stream (distributed global parity), so even at 1.5% sampling, every region of the file gets an independent error-correction probe.
 
-To increase audio coverage: raise `BAUD_RATE` in both scripts. 200 baud doubles coverage with minor reliability tradeoff; test post-Opus survival before committing.
+Audio provides 100% ECC coverage only for files where `ecc_bytes ≤ floor(duration × 25)`. In practice this limits full audio coverage to raw files under ~22 bytes. For anything larger, audio acts as distributed global parity — not full redundancy.
+
+To increase audio coverage: raise `BAUD_RATE` in both scripts. 200 baud doubles coverage with a minor reliability tradeoff; test post-Opus survival before committing.
+
+---
+
+## Theoretical limits
+
+### Maximum file size
+
+| Mode | Index bits | Bytes/frame | Max frames | Max ECC stream | Max raw file |
+|------|-----------|-------------|------------|----------------|--------------|
+| **16-bit** (default) | 16 | 57 | 65,536 | 3.56 MB | ~3.11 MB |
+| **32-bit** (auto-selected) | 32 | 55 | 4,294,967,296 | ~220 GB | ~193 GB |
+
+The encoder automatically selects 16-bit when the payload fits in 65,536 frames; otherwise it switches to 32-bit. The 32-bit hard limit corresponds to a video approximately 4.5 years long at 30 fps.
+
+Max raw file = max ECC stream × (223 / 255) — the RS data efficiency ratio (32 ECC symbols per 255-byte block).
+
+### Audio coverage by file size
+
+| Raw file | ECC stream | Video duration | Audio bytes | Audio coverage |
+|----------|-----------|----------------|-------------|----------------|
+| 1 B | 33 B | ~1.0 s | 25 | 75.8% |
+| 22 B | 54 B | ~1.0 s | 25 | 46.3% |
+| 100 B | 132 B | ~1.0 s | 25 | 18.9% |
+| 1 KB | ~1.15 KB | ~1.0 s | 25 | ~2.2% |
+| 10 KB | ~11.5 KB | ~5.7 s | 142 | ~1.2% |
+| 100 KB | ~115 KB | ~57 s | 1,425 | ~1.2% |
+| 1 MB | ~1.15 MB | ~566 s | 14,150 | ~1.2% |
+| ~3.11 MB (max 16-bit) | ~3.56 MB | ~36.4 min | ~54,600 | ~1.5% |
+
+Audio byte count = `min(ecc_len, floor(total_duration_sec × 25))`.
+
+Audio 100% coverage threshold: ECC stream ≤ ~25 bytes (raw file ≤ ~22 bytes). Below this threshold a single 1-second video provides enough audio bandwidth to carry the entire ECC stream in the side channel.
+
+### Audio independence
+
+The audio channel is **fully independent** of the video. Decoding always attempts video-only RS first. Audio is only consulted if the video RS decode fails. A video with no audio stream (or with a completely garbled audio track) will still decode correctly as long as the video channel is intact.
 
 ---
 
