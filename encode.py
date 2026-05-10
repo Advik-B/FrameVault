@@ -76,6 +76,10 @@ def worker_count() -> int:
     return DEFAULT_WORKERS
 
 
+def parallel_chunksize(item_count: int, workers: int) -> int:
+    return max(1, item_count // max(1, workers * 4))
+
+
 def build_payload(filepath: str):
     path = Path(filepath)
     raw = path.read_bytes()
@@ -126,9 +130,14 @@ def ecc_encode(data: bytes) -> bytes:
     print(f"  Input: {len(data):,} bytes")
     blocks = [data[i:i + RS_DATA_BYTES] for i in range(0, len(data), RS_DATA_BYTES)]
     if len(blocks) >= PARALLEL_RS_MIN_BLOCKS and worker_count() > 1:
-        print(f"  Parallel RS workers: {min(worker_count(), len(blocks))}")
-        with ProcessPoolExecutor(max_workers=min(worker_count(), len(blocks))) as executor:
-            encoded_blocks = list(executor.map(rs_encode_block, blocks, chunksize=1))
+        rs_workers = min(worker_count(), len(blocks))
+        print(f"  Parallel RS workers: {rs_workers}")
+        with ProcessPoolExecutor(max_workers=rs_workers) as executor:
+            encoded_blocks = list(executor.map(
+                rs_encode_block,
+                blocks,
+                chunksize=parallel_chunksize(len(blocks), rs_workers),
+            ))
     else:
         encoded_blocks = [rs_encode_block(block) for block in blocks]
     encoded = b"".join(encoded_blocks)

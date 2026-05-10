@@ -69,6 +69,10 @@ def worker_count() -> int:
     return DEFAULT_WORKERS
 
 
+def parallel_chunksize(item_count: int, workers: int) -> int:
+    return max(1, item_count // max(1, workers * 4))
+
+
 def stream_frames(video_path: str):
     # Pipe raw RGB frames from ffmpeg one at a time to avoid loading the full video into RAM.
     # Map only the video stream and let ffmpeg output every decoded frame in source order.
@@ -195,8 +199,13 @@ def rs_decode(data: bytes, erasures: list[int] | None = None) -> bytes:
         tasks.append((block, block_erasures))
 
     if len(tasks) >= PARALLEL_RS_MIN_BLOCKS and worker_count() > 1:
-        with ProcessPoolExecutor(max_workers=min(worker_count(), len(tasks))) as executor:
-            decoded_blocks = list(executor.map(rs_decode_block, tasks, chunksize=1))
+        rs_workers = min(worker_count(), len(tasks))
+        with ProcessPoolExecutor(max_workers=rs_workers) as executor:
+            decoded_blocks = list(executor.map(
+                rs_decode_block,
+                tasks,
+                chunksize=parallel_chunksize(len(tasks), rs_workers),
+            ))
     else:
         decoded_blocks = [rs_decode_block(task) for task in tasks]
     return b"".join(decoded_blocks)
@@ -344,7 +353,7 @@ def decode(video_path: str, output_dir: str = "."):
                                 header_bits, data_bits_per_frame = frame_layout(index_bits)
                                 data_bytes_per_frame = data_bits_per_frame // 8
 
-            for offset, bits in enumerate(executor.map(read_blocks, frame_batch), start=1):
+            for bits in executor.map(read_blocks, frame_batch):
                 total += 1
                 idx, data_bits = decode_frame(bits, index_bits, header_bits)
                 if idx is None:
