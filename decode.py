@@ -250,11 +250,38 @@ def decode_qr_metadata(frame: np.ndarray, detector) -> dict | None:
     if detector is None:
         return None
     bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-    data, _, _ = detector.detectAndDecode(bgr)
+    # cv2's QR detector can fail when the QR code fills a large fraction of the
+    # frame (as it does at 1920x1080 with the current rendering settings).
+    # Try progressively smaller scales until detection succeeds.
+    data = ""
+    h, w = bgr.shape[:2]
+    for scale in (1.0, 0.5, 0.25, 0.125):
+        img = cv2.resize(bgr, (max(1, int(w * scale)), max(1, int(h * scale)))) if scale < 1.0 else bgr
+        data, _, _ = detector.detectAndDecode(img)
+        if data:
+            break
     if not data:
         gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
         _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        data, _, _ = detector.detectAndDecode(binary)
+        for scale in (0.5, 0.25, 0.125):
+            img = cv2.resize(binary, (max(1, int(w * scale)), max(1, int(h * scale))))
+            data, _, _ = detector.detectAndDecode(img)
+            if data:
+                break
+    if not data:
+        # cv2's QRCodeDetector fails on certain QR masking patterns; try pyzbar.
+        try:
+            from pyzbar import pyzbar as _pyzbar
+            gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+            for scale in (1.0, 0.5, 0.25):
+                h2, w2 = gray.shape
+                img = cv2.resize(gray, (max(1, int(w2 * scale)), max(1, int(h2 * scale)))) if scale < 1.0 else gray
+                codes = _pyzbar.decode(img)
+                if codes:
+                    data = codes[0].data.decode("utf-8", errors="replace")
+                    break
+        except Exception:
+            pass
     if not data:
         return None
     try:
