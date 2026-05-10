@@ -5,13 +5,18 @@ import decode
 
 
 class AudioLayoutTests(unittest.TestCase):
-    def test_distributed_audio_positions_span_stream(self):
-        positions = encode.compute_audio_positions(1000, 25, encode.AUDIO_LAYOUT_DISTRIBUTED)
+    def test_distributed_audio_positions_cover_full_range(self):
+        ecc_len = 1000
+        positions = encode.compute_audio_positions(ecc_len, 25, encode.AUDIO_LAYOUT_DISTRIBUTED)
         self.assertEqual(len(positions), 25)
-        self.assertGreater(positions[0], 0)
-        self.assertLess(positions[0], 100)
-        self.assertGreater(positions[-1], 900)
+        self.assertEqual(positions[0], 0)
+        self.assertEqual(positions[-1], ecc_len - 1)
         self.assertTrue((positions[1:] > positions[:-1]).all())
+
+    def test_audio_positions_cover_all_bytes_when_full_audio(self):
+        ecc_len = 128
+        positions = encode.compute_audio_positions(ecc_len, ecc_len, encode.AUDIO_LAYOUT_DISTRIBUTED)
+        self.assertEqual(list(positions), list(range(ecc_len)))
 
     def test_merge_audio_bytes_uses_planned_positions(self):
         ecc = bytes(range(200))

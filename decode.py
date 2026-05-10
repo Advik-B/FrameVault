@@ -273,10 +273,10 @@ def compute_audio_positions(ecc_len: int, audio_byte_count: int, layout: str | N
     audio_byte_count = min(audio_byte_count, ecc_len)
     if layout in (None, AUDIO_LAYOUT_PREFIX) or audio_byte_count >= ecc_len:
         return np.arange(audio_byte_count, dtype=np.int64)
-    step = ecc_len / audio_byte_count
-    # Center one sample within each interval so audio redundancy spans the full ECC stream.
-    positions = np.floor(np.arange(audio_byte_count, dtype=np.float64) * step + step / 2.0).astype(np.int64)
-    return np.clip(positions, 0, ecc_len - 1)
+    if audio_byte_count == 1:
+        return np.array([ecc_len // 2], dtype=np.int64)
+    # Spread samples across the full ECC span so audio coverage reaches both ends.
+    return np.linspace(0, ecc_len - 1, audio_byte_count, dtype=np.int64)
 
 
 def merge_audio_bytes(
