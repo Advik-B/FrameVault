@@ -16,6 +16,11 @@ try:
 except ImportError:  # pragma: no cover - optional for older videos
     cv2 = None
 
+try:
+    from pyzbar import pyzbar as _pyzbar
+except ImportError:  # pragma: no cover - optional fallback QR detector
+    _pyzbar = None
+
 # Must match encoder exactly
 FRAME_WIDTH = 1920
 FRAME_HEIGHT = 1080
@@ -268,20 +273,16 @@ def decode_qr_metadata(frame: np.ndarray, detector) -> dict | None:
             data, _, _ = detector.detectAndDecode(img)
             if data:
                 break
-    if not data:
+    if not data and _pyzbar is not None:
         # cv2's QRCodeDetector fails on certain QR masking patterns; try pyzbar.
-        try:
-            from pyzbar import pyzbar as _pyzbar
-            gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-            for scale in (1.0, 0.5, 0.25):
-                h2, w2 = gray.shape
-                img = cv2.resize(gray, (max(1, int(w2 * scale)), max(1, int(h2 * scale)))) if scale < 1.0 else gray
-                codes = _pyzbar.decode(img)
-                if codes:
-                    data = codes[0].data.decode("utf-8", errors="replace")
-                    break
-        except Exception:
-            pass
+        gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+        for scale in (1.0, 0.5, 0.25):
+            h2, w2 = gray.shape
+            img = cv2.resize(gray, (max(1, int(w2 * scale)), max(1, int(h2 * scale)))) if scale < 1.0 else gray
+            codes = _pyzbar.decode(img)
+            if codes:
+                data = codes[0].data.decode("utf-8", errors="replace")
+                break
     if not data:
         return None
     try:
