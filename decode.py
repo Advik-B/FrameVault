@@ -276,7 +276,7 @@ def compute_audio_positions(ecc_len: int, audio_byte_count: int, layout: str | N
     if audio_byte_count == 1:
         return np.array([ecc_len // 2], dtype=np.int64)
     # Spread samples across the full ECC span so audio coverage reaches both ends.
-    return np.linspace(0, ecc_len - 1, audio_byte_count, dtype=np.int64)
+    return np.linspace(0, ecc_len - 1, audio_byte_count).astype(np.int64)
 
 
 def merge_audio_bytes(
