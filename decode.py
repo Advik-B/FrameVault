@@ -2,6 +2,7 @@
 
 import sys
 import os
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 import json
 import hashlib
 import struct
@@ -14,6 +15,11 @@ try:
     import cv2
 except ImportError:  # pragma: no cover - optional for older videos
     cv2 = None
+
+try:
+    from pyzbar import pyzbar as _pyzbar
+except ImportError:  # pragma: no cover - optional fallback QR detector
+    _pyzbar = None
 
 # Must match encoder exactly
 FRAME_WIDTH = 1920
@@ -36,6 +42,17 @@ SAMPLES_PER_SYMBOL = SAMPLE_RATE // BAUD_RATE       # 441
 FSK_FREQS = [1000, 1200, 1400, 1600]
 
 RS_ECC_SYMBOLS = 32
+RS_BLOCK_SIZE = 255
+
+# Parallelism
+DEFAULT_WORKERS = max(1, os.cpu_count() or 1)
+FRAME_BATCH_SIZE = 8
+PARALLEL_RS_MIN_BLOCKS = 4
+PARALLEL_CHUNK_FACTOR = 4
+
+# Audio layout
+AUDIO_LAYOUT_PREFIX = "prefix"
+AUDIO_LAYOUT_DISTRIBUTED = "distributed"
 
 # Metadata QR
 METADATA_DURATION_SEC = 1.0
@@ -46,6 +63,20 @@ METADATA_FRAMES = max(1, int(round(FRAME_RATE * METADATA_DURATION_SEC)))
 # Center region (64 - 2*16 = 32x32 px) is much cleaner.
 BLOCK_SAMPLE_MARGIN = 16
 THRESHOLD = 128
+
+
+def worker_count() -> int:
+    raw = os.getenv("FRAMEVAULT_WORKERS")
+    if raw:
+        try:
+            return max(1, int(raw))
+        except ValueError:
+            pass
+    return DEFAULT_WORKERS
+
+
+def parallel_chunksize(item_count: int, workers: int) -> int:
+    return max(1, item_count // max(1, workers * PARALLEL_CHUNK_FACTOR))
 
 
 def stream_frames(video_path: str):
@@ -73,17 +104,11 @@ def read_blocks(frame: np.ndarray) -> np.ndarray:
     # Sample the center region of each 64x64 block to avoid edge compression artifacts.
     # Returns a flat (480,) binary array.
     m = BLOCK_SAMPLE_MARGIN
-    luma = frame[:, :, 0]  # R channel is sufficient for grayscale frames
-    bits = np.empty(TOTAL_BLOCKS, dtype=np.uint8)
-    for i in range(TOTAL_BLOCKS):
-        r = i // COLS
-        c = i % COLS
-        y0 = r * BLOCK_SIZE + m
-        y1 = (r + 1) * BLOCK_SIZE - m
-        x0 = c * BLOCK_SIZE + m
-        x1 = (c + 1) * BLOCK_SIZE - m
-        bits[i] = 1 if np.mean(luma[y0:y1, x0:x1]) >= THRESHOLD else 0
-    return bits
+    luma = frame[:ROWS * BLOCK_SIZE, :COLS * BLOCK_SIZE, 0]  # R channel is sufficient for grayscale frames
+    blocks = luma.reshape(ROWS, BLOCK_SIZE, COLS, BLOCK_SIZE)
+    centers = blocks[:, m:BLOCK_SIZE - m, :, m:BLOCK_SIZE - m]
+    means = centers.mean(axis=(1, 3))
+    return (means >= THRESHOLD).astype(np.uint8).reshape(TOTAL_BLOCKS)
 
 
 def frame_layout(index_bits: int) -> tuple[int, int]:
@@ -153,28 +178,43 @@ def decode_fsk(samples: np.ndarray) -> bytes:
     return np.packbits(bits[:n_bytes * 8]).tobytes()
 
 
-def rs_decode(data: bytes, erasures: list[int] | None = None) -> bytes:
+def rs_decode_block(args) -> bytes:
+    block, block_erasures = args
     rs = reedsolo.RSCodec(RS_ECC_SYMBOLS)
-    rs_block_size = 255
-    decoded_blocks = []
-    for block_start in range(0, len(data), rs_block_size):
-        block = data[block_start:block_start + rs_block_size]
+    if block_erasures:
+        decoded, _, _ = rs.decode(block, erase_pos=block_erasures)
+    else:
+        decoded, _, _ = rs.decode(block)
+    return bytes(decoded)
+
+
+def rs_decode(data: bytes, erasures: list[int] | None = None) -> bytes:
+    tasks = []
+    for block_start in range(0, len(data), RS_BLOCK_SIZE):
+        block = data[block_start:block_start + RS_BLOCK_SIZE]
         if not block:
             break
         if erasures:
             block_erasures = [
                 pos - block_start
                 for pos in erasures
-                if block_start <= pos < block_start + rs_block_size
+                if block_start <= pos < block_start + RS_BLOCK_SIZE
             ]
         else:
             block_erasures = None
-        if block_erasures:
-            decoded, _, _ = rs.decode(block, erase_pos=block_erasures)
-        else:
-            decoded, _, _ = rs.decode(block)
-        decoded_blocks.append(decoded)
-    return b"".join(bytes(block) for block in decoded_blocks)
+        tasks.append((block, block_erasures))
+
+    if len(tasks) >= PARALLEL_RS_MIN_BLOCKS and worker_count() > 1:
+        rs_workers = min(worker_count(), len(tasks))
+        with ProcessPoolExecutor(max_workers=rs_workers) as executor:
+            decoded_blocks = list(executor.map(
+                rs_decode_block,
+                tasks,
+                chunksize=parallel_chunksize(len(tasks), rs_workers),
+            ))
+    else:
+        decoded_blocks = [rs_decode_block(task) for task in tasks]
+    return b"".join(decoded_blocks)
 
 
 def parse_payload(payload: bytes, expected_size: int | None = None):
@@ -206,6 +246,8 @@ def normalize_qr_meta(raw: dict) -> dict:
         "frames": to_int(raw.get("n") if "n" in raw else raw.get("frames")),
         "index_bits": to_int(raw.get("i") if "i" in raw else raw.get("index_bits")),
         "metadata_frames": to_int(raw.get("m") if "m" in raw else raw.get("metadata_frames")),
+        "audio_bytes": to_int(raw.get("a") if "a" in raw else raw.get("audio_bytes")),
+        "audio_layout": raw.get("p") if "p" in raw else raw.get("audio_layout"),
     }
 
 
@@ -213,11 +255,34 @@ def decode_qr_metadata(frame: np.ndarray, detector) -> dict | None:
     if detector is None:
         return None
     bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-    data, _, _ = detector.detectAndDecode(bgr)
+    # cv2's QR detector can fail when the QR code fills a large fraction of the
+    # frame (as it does at 1920x1080 with the current rendering settings).
+    # Try progressively smaller scales until detection succeeds.
+    data = ""
+    h, w = bgr.shape[:2]
+    for scale in (1.0, 0.5, 0.25, 0.125):
+        img = cv2.resize(bgr, (max(1, int(w * scale)), max(1, int(h * scale)))) if scale < 1.0 else bgr
+        data, _, _ = detector.detectAndDecode(img)
+        if data:
+            break
     if not data:
         gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
         _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        data, _, _ = detector.detectAndDecode(binary)
+        for scale in (0.5, 0.25, 0.125):
+            img = cv2.resize(binary, (max(1, int(w * scale)), max(1, int(h * scale))))
+            data, _, _ = detector.detectAndDecode(img)
+            if data:
+                break
+    if not data and _pyzbar is not None:
+        # cv2's QRCodeDetector fails on certain QR masking patterns; try pyzbar.
+        gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+        for scale in (1.0, 0.5, 0.25):
+            h2, w2 = gray.shape
+            img = cv2.resize(gray, (max(1, int(w2 * scale)), max(1, int(h2 * scale)))) if scale < 1.0 else gray
+            codes = _pyzbar.decode(img)
+            if codes:
+                data = codes[0].data.decode("utf-8", errors="replace")
+                break
     if not data:
         return None
     try:
@@ -228,6 +293,47 @@ def decode_qr_metadata(frame: np.ndarray, detector) -> dict | None:
     if meta["filename"] is not None and meta["size"] is not None and meta["sha256"] is not None:
         return meta
     return None
+
+
+def compute_audio_positions(ecc_len: int, audio_byte_count: int, layout: str | None) -> np.ndarray:
+    if ecc_len <= 0 or audio_byte_count <= 0:
+        return np.empty(0, dtype=np.int64)
+    audio_byte_count = min(audio_byte_count, ecc_len)
+    if layout in (None, AUDIO_LAYOUT_PREFIX) or audio_byte_count >= ecc_len:
+        return np.arange(audio_byte_count, dtype=np.int64)
+    if audio_byte_count == 1:
+        return np.array([ecc_len // 2], dtype=np.int64)
+    # Spread samples across the full ECC span so audio coverage reaches both ends.
+    return np.round(np.linspace(0, ecc_len - 1, audio_byte_count)).astype(np.int64)
+
+
+def merge_audio_bytes(
+    ecc_video: bytes,
+    audio_bytes: bytes,
+    expected_audio_bytes: int,
+    layout: str | None,
+) -> tuple[bytes, np.ndarray]:
+    if not audio_bytes or not ecc_video:
+        return ecc_video, np.empty(0, dtype=np.int64)
+    planned_positions = compute_audio_positions(len(ecc_video), expected_audio_bytes, layout)
+    if len(planned_positions) == 0:
+        return ecc_video, np.empty(0, dtype=np.int64)
+    recovered_positions = planned_positions[:min(len(audio_bytes), len(planned_positions))]
+    merged = bytearray(ecc_video)
+    for audio_idx, ecc_idx in enumerate(recovered_positions):
+        merged[int(ecc_idx)] = audio_bytes[audio_idx]
+    return bytes(merged), recovered_positions
+
+
+def batched_frames(frames, batch_size: int):
+    batch = []
+    for frame in frames:
+        batch.append(frame)
+        if len(batch) >= batch_size:
+            yield batch
+            batch = []
+    if batch:
+        yield batch
 
 
 def decode(video_path: str, output_dir: str = "."):
@@ -244,44 +350,51 @@ def decode(video_path: str, output_dir: str = "."):
     qr_meta = None
     qr_detector = cv2.QRCodeDetector() if cv2 is not None else None
     early_frames = {}
+    frame_workers = min(worker_count(), FRAME_BATCH_SIZE)
+    if frame_workers > 1:
+        print(f"  Parallel frame workers: {frame_workers}")
+    with ThreadPoolExecutor(max_workers=frame_workers) as executor:
+        for frame_batch in batched_frames(stream_frames(video_path), FRAME_BATCH_SIZE):
+            batch_start = total
+            for offset, frame_np in enumerate(frame_batch, start=1):
+                frame_number = batch_start + offset
+                if frame_number <= METADATA_FRAMES and qr_meta is None:
+                    qr_meta = decode_qr_metadata(frame_np, qr_detector)
+                    if qr_meta:
+                        print(f"  QR metadata decoded from frame {frame_number}.")
+                        qr_index_bits = qr_meta.get("index_bits")
+                        if qr_index_bits is not None:
+                            if qr_index_bits not in (DEFAULT_FRAME_INDEX_BITS, EXTENDED_FRAME_INDEX_BITS):
+                                print(
+                                    f"  Warning: unsupported index width {qr_index_bits}; falling back to "
+                                    f"{index_bits}-bit decoding (may fail)."
+                                )
+                            elif qr_index_bits != index_bits:
+                                old_index_bits = index_bits
+                                if frames or early_frames:
+                                    print(
+                                        f"  Warning: unexpected index width change from {old_index_bits} to "
+                                        f"{qr_index_bits} bits; this may indicate corrupted or mixed sources. "
+                                        "Discarding previously decoded frames."
+                                    )
+                                    frames = {}
+                                    early_frames = {}
+                                index_bits = qr_index_bits
+                                header_bits, data_bits_per_frame = frame_layout(index_bits)
+                                data_bytes_per_frame = data_bits_per_frame // 8
 
-    for frame_np in stream_frames(video_path):
-        total += 1
-        if total <= METADATA_FRAMES and qr_meta is None:
-            qr_meta = decode_qr_metadata(frame_np, qr_detector)
-            if qr_meta:
-                print(f"  QR metadata decoded from frame {total}.")
-                qr_index_bits = qr_meta.get("index_bits")
-                if qr_index_bits is not None:
-                    if qr_index_bits not in (DEFAULT_FRAME_INDEX_BITS, EXTENDED_FRAME_INDEX_BITS):
-                        print(
-                            f"  Warning: unsupported index width {qr_index_bits}; falling back to "
-                            f"{index_bits}-bit decoding (may fail)."
-                        )
-                    elif qr_index_bits != index_bits:
-                        old_index_bits = index_bits
-                        if frames or early_frames:
-                            print(
-                                f"  Warning: unexpected index width change from {old_index_bits} to "
-                                f"{qr_index_bits} bits; this may indicate corrupted or mixed sources. "
-                                "Discarding previously decoded frames."
-                            )
-                            frames = {}
-                            early_frames = {}
-                        index_bits = qr_index_bits
-                        header_bits, data_bits_per_frame = frame_layout(index_bits)
-                        data_bytes_per_frame = data_bits_per_frame // 8
-        bits = read_blocks(frame_np)
-        idx, data_bits = decode_frame(bits, index_bits, header_bits)
-        if idx is None:
-            sync_fail += 1
-        else:
-            if total <= METADATA_FRAMES and qr_meta is None:
-                early_frames[idx] = data_bits
-            else:
-                frames[idx] = data_bits
-        if total % 30 == 0:
-            print(f"  {total} frames read, {len(frames)} valid, {sync_fail} sync failures", end="\r", flush=True)
+            for bits in executor.map(read_blocks, frame_batch):
+                total += 1
+                idx, data_bits = decode_frame(bits, index_bits, header_bits)
+                if idx is None:
+                    sync_fail += 1
+                else:
+                    if total <= METADATA_FRAMES and qr_meta is None:
+                        early_frames[idx] = data_bits
+                    else:
+                        frames[idx] = data_bits
+                if total % 30 == 0:
+                    print(f"  {total} frames read, {len(frames)} valid, {sync_fail} sync failures", end="\r", flush=True)
 
     print()
     print(f"  Total: {total} | Valid: {len(frames)} | Sync failures: {sync_fail}")
@@ -344,10 +457,9 @@ def decode(video_path: str, output_dir: str = "."):
     # Each RS block is at most 255 bytes. The final block may be shorter.
     # If QR metadata isn't available, trimming to full blocks can avoid
     # trailing frame padding, but keep short payloads intact.
-    rs_block_size = 255
     ecc_video = ecc_from_video
-    if expected_ecc_bytes is None and len(ecc_video) >= rs_block_size:
-        ecc_video = ecc_video[: (len(ecc_video) // rs_block_size) * rs_block_size]
+    if expected_ecc_bytes is None and len(ecc_video) >= RS_BLOCK_SIZE:
+        ecc_video = ecc_video[: (len(ecc_video) // RS_BLOCK_SIZE) * RS_BLOCK_SIZE]
     missing_byte_positions = [
         i * data_bytes_per_frame + j
         for i in missing
@@ -370,20 +482,24 @@ def decode(video_path: str, output_dir: str = "."):
     # error patterns). Bytes that video mangled may be intact in audio and vice versa.
     # RS then corrects whatever residual errors remain.
     if payload is None and len(audio_bytes) > 0:
-        merged = bytearray(ecc_video)
-        for i in range(min(len(audio_bytes), len(merged))):
-            merged[i] = audio_bytes[i]
-        erasures_merged = [pos for pos in erasures_video if pos >= len(audio_bytes)] if erasures_video else None
-        print(f"  Trying merged (audio+video)...")
+        audio_layout = qr_meta.get("audio_layout") if qr_meta else None
+        expected_audio_bytes = qr_meta.get("audio_bytes") if qr_meta else len(audio_bytes)
+        merged, recovered_positions = merge_audio_bytes(ecc_video, audio_bytes, expected_audio_bytes, audio_layout)
+        recovered_position_set = set(int(pos) for pos in recovered_positions.tolist())
+        erasures_merged = (
+            [pos for pos in erasures_video if pos not in recovered_position_set]
+            if erasures_video else None
+        )
+        print(f"  Trying merged (audio+video, layout={audio_layout or AUDIO_LAYOUT_PREFIX})...")
         try:
-            payload = rs_decode(bytes(merged), erasures=erasures_merged)
+            payload = rs_decode(merged, erasures=erasures_merged)
             print(f"  RS decode succeeded on merged stream.")
         except reedsolo.ReedSolomonError as e:
             print(f"  Merged RS failed: {e}")
 
     # Strategy C: audio only (only useful if audio covers the whole file, rare)
     if payload is None and len(audio_bytes) > 0:
-        audio_trimmed = audio_bytes[: (len(audio_bytes) // rs_block_size) * rs_block_size]
+        audio_trimmed = audio_bytes[: (len(audio_bytes) // RS_BLOCK_SIZE) * RS_BLOCK_SIZE]
         if audio_trimmed:
             print(f"  Trying audio-only...")
             try:
