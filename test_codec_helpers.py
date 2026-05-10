@@ -18,6 +18,11 @@ class AudioLayoutTests(unittest.TestCase):
         positions = encode.compute_audio_positions(ecc_len, ecc_len, encode.AUDIO_LAYOUT_DISTRIBUTED)
         self.assertEqual(list(positions), list(range(ecc_len)))
 
+    def test_audio_positions_single_byte_midpoint(self):
+        ecc_len = 101
+        positions = encode.compute_audio_positions(ecc_len, 1, encode.AUDIO_LAYOUT_DISTRIBUTED)
+        self.assertEqual(list(positions), [ecc_len // 2])
+
     def test_merge_audio_bytes_uses_planned_positions(self):
         ecc = bytes(range(200))
         planned_audio = 10
