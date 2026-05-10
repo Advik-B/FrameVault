@@ -2,6 +2,7 @@
 
 import sys
 import os
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 import json
 import hashlib
 import math
@@ -9,7 +10,6 @@ import struct
 import subprocess
 import tempfile
 import wave
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 import numpy as np
 from pathlib import Path
 
@@ -50,6 +50,7 @@ RS_BLOCK_SIZE = RS_DATA_BYTES + RS_ECC_SYMBOLS
 # Parallelism
 DEFAULT_WORKERS = max(1, os.cpu_count() or 1)
 PARALLEL_RS_MIN_BLOCKS = 4
+PARALLEL_CHUNK_FACTOR = 4
 
 # Audio layout
 AUDIO_LAYOUT_PREFIX = "prefix"
@@ -77,7 +78,7 @@ def worker_count() -> int:
 
 
 def parallel_chunksize(item_count: int, workers: int) -> int:
-    return max(1, item_count // max(1, workers * 4))
+    return max(1, item_count // max(1, workers * PARALLEL_CHUNK_FACTOR))
 
 
 def build_payload(filepath: str):
@@ -255,6 +256,7 @@ def compute_audio_positions(ecc_len: int, audio_byte_count: int, layout: str = A
     if layout == AUDIO_LAYOUT_PREFIX or audio_byte_count >= ecc_len:
         return np.arange(audio_byte_count, dtype=np.int64)
     step = ecc_len / audio_byte_count
+    # Center one sample within each interval so audio redundancy spans the full ECC stream.
     positions = np.floor(np.arange(audio_byte_count, dtype=np.float64) * step + step / 2.0).astype(np.int64)
     return np.clip(positions, 0, ecc_len - 1)
 
