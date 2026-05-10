@@ -234,7 +234,7 @@ This tests the full encode/decode cycle locally. If this fails, the issue is in 
 | Max video duration | ~36 min (16-bit) / ~4.5 years (32-bit) |
 | Max file size (video) | Scales with index width (16-bit default, 32-bit hard limit) |
 
-Audio capacity is 1.5% of video capacity at these settings. For small files (under ~1.5 KB after ECC), audio covers 100% of the payload and provides full redundancy. For larger files it covers a prefix.
+Audio capacity is 1.5% of video capacity at these settings. For small files (under ~1.5 KB after ECC), audio covers 100% of the payload and provides full redundancy. For larger files, the encoder now distributes those audio bytes across the entire ECC stream instead of only protecting the prefix.
 
 To increase audio coverage: raise `BAUD_RATE` in both scripts. 200 baud doubles coverage with minor reliability tradeoff; test post-Opus survival before committing.
 
@@ -248,9 +248,9 @@ To increase audio coverage: raise `BAUD_RATE` in both scripts. 200 baud doubles 
 
 **ECC is RS (with erasures for missing frames).** RS handles both errors and erasures. The decoder already treats bytes from sync-failed frames as erasures (known-missing positions) when calling `reedsolo`, which improves recovery vs. pure error correction. Corruption inside frames that still pass sync is still handled as errors.
 
-**Audio coverage is partial for large files.** Audio only carries the first N bytes of the ECC stream. For files where the video channel has widespread failures and audio doesn't cover the affected range, recovery fails. Full redundancy would require a second pass or interleaved encoding.
+**Audio coverage is still partial for large files.** The audio track now samples ECC bytes evenly across the entire stream ("global parity"), which is much more useful than prefix-only redundancy, but the channel is still bandwidth-limited. Full redundancy would require a second pass or a higher-bandwidth modulation scheme.
 
-**reedsolo is pure Python.** For files above ~10 MB, the ECC step is slow. Consider using a compiled RS library or chunking the work for large files.
+**reedsolo is pure Python.** The scripts now parallelize RS block work across CPU cores, which helps substantially on larger payloads, but a compiled RS library would still be faster.
 
 ---
 
@@ -276,13 +276,14 @@ Payload layout (before ECC):
 +-------------------+---------------------------+-------------------+
 
 Metadata JSON fields:
-  v          encoding version (integer, currently 3)
+  v          encoding version (integer, currently 4)
   filename   original filename (string)
   size       original file size in bytes (integer)
   sha256     SHA256 hex digest of the original file bytes (string)
+  audio_layout  audio redundancy layout stored in the side channel ("distributed")
 ```
 
-The RS-encoded payload is then split into 456-bit chunks, one chunk per video frame. The audio channel carries the RS-encoded bytes (not the raw payload) starting from byte 0.
+The RS-encoded payload is then split into 456-bit chunks, one chunk per video frame. The audio channel carries sampled RS bytes (not the raw payload), spaced evenly across the full ECC stream so that the side channel can help recovery anywhere in the file instead of only at the beginning.
 
 ## QR metadata (first 1 second)
 
@@ -290,15 +291,26 @@ The first 1 second (`METADATA_DURATION_SEC`) is QR codes that carry compact meta
 
 ```
 {
-  "v": 2,              // encoding version
+  "v": 4,              // encoding version
   "f": "file.bin",     // filename
   "s": 12345,          // size in bytes
   "h": "sha256...",    // SHA256 hex
   "e": 67890,          // ECC stream length in bytes
   "n": 42,             // data frame count
-  "m": 5               // metadata frame count
+  "m": 5,              // metadata frame count
+  "a": 250,            // audio bytes written into the side channel
+  "p": "distributed"   // audio layout used by the encoder/decoder
 }
 ```
+
+## Parallel processing
+
+`encode.py` and `decode.py` now use concurrent workers for the CPU-heavy parts of the pipeline:
+
+- Reed-Solomon block encode/decode runs in a `ProcessPoolExecutor`
+- Video frame generation and frame block analysis run concurrently across worker threads
+
+You can cap worker usage with `FRAMEVAULT_WORKERS=<n>` if you want to reduce CPU load.
 
 ---
 

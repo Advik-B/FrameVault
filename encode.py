@@ -9,6 +9,7 @@ import struct
 import subprocess
 import tempfile
 import wave
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 import numpy as np
 from pathlib import Path
 
@@ -43,6 +44,17 @@ BYTES_PER_SEC_AUDIO = (BAUD_RATE * BITS_PER_SYMBOL) // 8  # 25 bytes/sec
 
 # Reed-Solomon
 RS_ECC_SYMBOLS = 32                 # ECC bytes per 255-byte RS block
+RS_DATA_BYTES = 255 - RS_ECC_SYMBOLS
+RS_BLOCK_SIZE = RS_DATA_BYTES + RS_ECC_SYMBOLS
+
+# Parallelism
+DEFAULT_WORKERS = max(1, os.cpu_count() or 1)
+PARALLEL_RS_MIN_BLOCKS = 4
+
+# Audio layout
+AUDIO_LAYOUT_PREFIX = "prefix"
+AUDIO_LAYOUT_DISTRIBUTED = "distributed"
+AUDIO_LAYOUT = AUDIO_LAYOUT_DISTRIBUTED
 
 # Metadata QR
 METADATA_DURATION_SEC = 1.0
@@ -51,7 +63,17 @@ QR_BORDER_MODULES = 4
 QR_ERROR_CORRECTION = qrcode.constants.ERROR_CORRECT_Q
 QR_MIN_MODULE_PX = 6
 
-ENCODING_VERSION = 3
+ENCODING_VERSION = 4
+
+
+def worker_count() -> int:
+    raw = os.getenv("FRAMEVAULT_WORKERS")
+    if raw:
+        try:
+            return max(1, int(raw))
+        except ValueError:
+            pass
+    return DEFAULT_WORKERS
 
 
 def build_payload(filepath: str):
@@ -63,6 +85,7 @@ def build_payload(filepath: str):
         "filename": path.name,
         "size": len(raw),
         "sha256": sha256,
+        "audio_layout": AUDIO_LAYOUT,
     }
     meta_bytes = json.dumps(meta, separators=(",", ":")).encode()
     # Layout: [4 bytes: meta_len][meta JSON][raw file bytes]
@@ -70,7 +93,14 @@ def build_payload(filepath: str):
     return payload, meta
 
 
-def build_qr_metadata(meta: dict, ecc_len: int, num_frames: int, index_bits: int) -> bytes:
+def build_qr_metadata(
+    meta: dict,
+    ecc_len: int,
+    num_frames: int,
+    index_bits: int,
+    audio_bytes: int,
+    audio_layout: str,
+) -> bytes:
     qr_meta = {
         "v": ENCODING_VERSION,
         "f": meta["filename"],
@@ -80,16 +110,28 @@ def build_qr_metadata(meta: dict, ecc_len: int, num_frames: int, index_bits: int
         "n": num_frames,
         "i": index_bits,
         "m": METADATA_FRAMES,
+        "a": audio_bytes,
+        "p": audio_layout,
     }
     return json.dumps(qr_meta, separators=(",", ":")).encode()
 
 
+def rs_encode_block(block: bytes) -> bytes:
+    return bytes(reedsolo.RSCodec(RS_ECC_SYMBOLS).encode(block))
+
+
 def ecc_encode(data: bytes) -> bytes:
     # reedsolo chunks into (255 - RS_ECC_SYMBOLS) = 223 byte data blocks
-    # Each block gets RS_ECC_SYMBOLS parity bytes appended
+    # Each block gets RS_ECC_SYMBOLS parity bytes appended.
     print(f"  Input: {len(data):,} bytes")
-    rs = reedsolo.RSCodec(RS_ECC_SYMBOLS)
-    encoded = bytes(rs.encode(data))
+    blocks = [data[i:i + RS_DATA_BYTES] for i in range(0, len(data), RS_DATA_BYTES)]
+    if len(blocks) >= PARALLEL_RS_MIN_BLOCKS and worker_count() > 1:
+        print(f"  Parallel RS workers: {min(worker_count(), len(blocks))}")
+        with ProcessPoolExecutor(max_workers=min(worker_count(), len(blocks))) as executor:
+            encoded_blocks = list(executor.map(rs_encode_block, blocks, chunksize=1))
+    else:
+        encoded_blocks = [rs_encode_block(block) for block in blocks]
+    encoded = b"".join(encoded_blocks)
     print(f"  ECC output: {len(encoded):,} bytes ({(len(encoded)/len(data)-1)*100:.1f}% overhead)")
     return encoded
 
@@ -129,6 +171,11 @@ def make_frame(frame_idx: int, data_bits: np.ndarray, index_bits: int) -> bytes:
     full_frame[:frame_2d.shape[0], :frame_2d.shape[1]] = frame_2d
     frame_rgb = np.stack([full_frame, full_frame, full_frame], axis=2)    # (1080, 1920, 3)
     return frame_rgb.tobytes()
+
+
+def make_frame_task(args) -> bytes:
+    frame_idx, data_bits, index_bits = args
+    return make_frame(frame_idx, data_bits, index_bits)
 
 
 def make_qr_frame(payload: bytes) -> bytes:
@@ -192,6 +239,25 @@ def make_audio_pcm(data: bytes, duration_sec: float) -> bytes:
     return (audio * 32767).astype(np.int16).tobytes()
 
 
+def compute_audio_positions(ecc_len: int, audio_byte_count: int, layout: str = AUDIO_LAYOUT) -> np.ndarray:
+    if ecc_len <= 0 or audio_byte_count <= 0:
+        return np.empty(0, dtype=np.int64)
+    audio_byte_count = min(audio_byte_count, ecc_len)
+    if layout == AUDIO_LAYOUT_PREFIX or audio_byte_count >= ecc_len:
+        return np.arange(audio_byte_count, dtype=np.int64)
+    step = ecc_len / audio_byte_count
+    positions = np.floor(np.arange(audio_byte_count, dtype=np.float64) * step + step / 2.0).astype(np.int64)
+    return np.clip(positions, 0, ecc_len - 1)
+
+
+def select_audio_bytes(ecc_data: bytes, audio_byte_count: int, layout: str = AUDIO_LAYOUT) -> bytes:
+    positions = compute_audio_positions(len(ecc_data), audio_byte_count, layout)
+    if len(positions) == 0:
+        return b""
+    ecc_array = np.frombuffer(ecc_data, dtype=np.uint8)
+    return ecc_array[positions].tobytes()
+
+
 def write_wav(pcm: bytes, path: str):
     with wave.open(path, "wb") as wf:
         wf.setnchannels(1)
@@ -233,13 +299,14 @@ def encode(input_path: str, output_path: str):
         all_bits = np.concatenate([all_bits, np.zeros(data_bits_per_frame - rem, dtype=np.uint8)])
 
     num_frames = len(all_bits) // data_bits_per_frame
-    qr_payload = build_qr_metadata(meta, len(ecc_data), num_frames, index_bits)
-    qr_frame = make_qr_frame(qr_payload)
     total_frames = num_frames + METADATA_FRAMES
     duration_sec = total_frames / FRAME_RATE
 
     video_bps = (data_bits_per_frame * FRAME_RATE) // 8
     audio_byte_count = min(len(ecc_data), int(duration_sec * BYTES_PER_SEC_AUDIO))
+    audio_payload = select_audio_bytes(ecc_data, audio_byte_count, AUDIO_LAYOUT)
+    qr_payload = build_qr_metadata(meta, len(ecc_data), num_frames, index_bits, audio_byte_count, AUDIO_LAYOUT)
+    qr_frame = make_qr_frame(qr_payload)
     audio_coverage_pct = audio_byte_count / len(ecc_data) * 100
 
     print(f"\n[3/5] Plan")
@@ -249,16 +316,16 @@ def encode(input_path: str, output_path: str):
     print(f"      Frame index:    {index_bits} bits")
     print(f"      Video channel:  {video_bps:,} bytes/sec ({data_bits_per_frame} bits/frame)")
     print(f"      Audio channel:  {BYTES_PER_SEC_AUDIO} bytes/sec (4-FSK @ {BAUD_RATE} baud)")
+    print(f"      Audio layout:   {AUDIO_LAYOUT}")
     print(f"      Audio covers:   {audio_byte_count:,}/{len(ecc_data):,} bytes ({audio_coverage_pct:.1f}%)")
     if audio_coverage_pct < 100:
-        print(f"      Note: audio carries only the first {audio_coverage_pct:.1f}% of data;")
-        print(f"            increase BAUD_RATE or use a shorter file for full coverage.")
+        print(f"      Note: audio bytes are spread across the full ECC stream for global parity coverage.")
 
     with tempfile.TemporaryDirectory() as tmp:
         audio_path = os.path.join(tmp, "audio.wav")
 
         print(f"\n[4/5] Generating audio track...")
-        pcm = make_audio_pcm(ecc_data[:audio_byte_count], duration_sec)
+        pcm = make_audio_pcm(audio_payload, duration_sec)
         write_wav(pcm, audio_path)
         print(f"      Written: {os.path.getsize(audio_path):,} bytes (WAV, mono, {SAMPLE_RATE}Hz)")
 
@@ -291,14 +358,21 @@ def encode(input_path: str, output_path: str):
             proc.stdin.write(qr_frame)
 
         written = METADATA_FRAMES
-        for i in range(num_frames):
-            chunk = all_bits[i * data_bits_per_frame:(i + 1) * data_bits_per_frame]
-            proc.stdin.write(make_frame(i, chunk, index_bits))
-            written += 1
-            if written % 30 == 0 or written == total_frames:
-                pct = written / total_frames * 100
-                bar = "#" * (int(pct) // 2) + "-" * (50 - int(pct) // 2)
-                print(f"      [{bar}] {pct:5.1f}%  ({written}/{total_frames})", end="\r", flush=True)
+        frame_workers = min(worker_count(), max(1, num_frames))
+        if frame_workers > 1:
+            print(f"      Parallel frame workers: {frame_workers}")
+        frame_tasks = (
+            (i, all_bits[i * data_bits_per_frame:(i + 1) * data_bits_per_frame], index_bits)
+            for i in range(num_frames)
+        )
+        with ThreadPoolExecutor(max_workers=frame_workers) as executor:
+            for frame_bytes in executor.map(make_frame_task, frame_tasks):
+                proc.stdin.write(frame_bytes)
+                written += 1
+                if written % 30 == 0 or written == total_frames:
+                    pct = written / total_frames * 100
+                    bar = "#" * (int(pct) // 2) + "-" * (50 - int(pct) // 2)
+                    print(f"      [{bar}] {pct:5.1f}%  ({written}/{total_frames})", end="\r", flush=True)
 
         proc.stdin.close()
         ret = proc.wait()
