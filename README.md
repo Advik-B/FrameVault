@@ -1,22 +1,36 @@
 # FrameVault
 
-A research study into extracting free, unlimited, lossless storage from YouTube by encoding arbitrary binary data into video frames and an audio FSK channel.
+A research study into extracting free, unlimited, lossless storage from YouTube by
+encoding arbitrary binary data into video frames and an audio FSK channel.
 
-This is not a product. It is a study.
+This is not a product. It is a study. The codec is implemented in **pure Rust** (the
+original Python prototype lives in git history).
 
 ---
 
 ## Concept
 
-YouTube re-encodes every uploaded video using lossy codecs (VP9, H.264, AV1 for video; Opus for audio). Naively storing data in pixel values would be destroyed immediately. This project works around that by designing an encoding layer *on top of* the video that survives re-encoding, rather than trying to prevent it.
+YouTube re-encodes every uploaded video using lossy codecs (VP9, H.264, AV1 for video;
+Opus for audio). Naively storing data in pixel values would be destroyed immediately.
+This project works around that by designing an encoding layer *on top of* the video that
+survives re-encoding, rather than trying to prevent it.
 
 Two independent data channels are used simultaneously:
 
-**Video channel** — each frame is a 30×16 grid of 64×64 pixel blocks. Every block is solid black or solid white (1 bit). Large uniform regions are the cheapest thing a DCT codec can possibly encode, so they survive re-encoding with negligible distortion. Thresholding the center of each block (avoiding compression artifacts at block edges) recovers the original bit reliably.
+**Video channel** — each frame is a 30×16 grid of 64×64 pixel blocks. Every block is solid
+black or solid white (1 bit). Large uniform regions are the cheapest thing a DCT codec can
+possibly encode, so they survive re-encoding with negligible distortion. Thresholding the
+center of each block (avoiding compression artifacts at block edges) recovers the original
+bit reliably.
 
-**Audio channel** — data is encoded as FSK (Frequency Shift Keying) tones: four frequencies map to 2-bit symbols at 100 baud. This is the same principle as a dial-up modem. Opus preserves tonal content in the 1–2 kHz range extremely well, so the tones survive re-encoding and can be recovered via FFT.
+**Audio channel** — data is encoded as FSK (Frequency Shift Keying) tones: four frequencies
+map to 2-bit symbols at 100 baud. This is the same principle as a dial-up modem. Opus
+preserves tonal content in the 1–2 kHz range extremely well, so the tones survive
+re-encoding and can be recovered via FFT.
 
-The two channels degrade via completely different codecs and completely different error patterns. Reed-Solomon ECC is applied to the raw data before splitting across channels, so errors from either channel can be corrected by the other.
+The two channels degrade via completely different codecs and completely different error
+patterns. Reed-Solomon ECC is applied to the raw data before splitting across channels, so
+errors from either channel can be corrected by the other.
 
 ---
 
@@ -50,10 +64,14 @@ input file
     +---------------------------+
                 |
                 v
-         [ffmpeg mux]
+         [libav mux]
          H.264 CRF 0 + AAC 320k
          YouTube-ready MP4
 ```
+
+Frames are generated directly as YUV420P luma planes (black = 16, white = 235, neutral
+chroma) and handed straight to the H.264 encoder — there is no intermediate RGB buffer or
+RGB→YUV scaling pass, which is the bulk of the speed advantage over the prototype.
 
 ### Frame layout
 
@@ -67,22 +85,18 @@ Each 1920×1080 frame contains a 30×16 grid of 64×64 pixel blocks:
 +--------+--------+--------+                         +--------+
 | DATA   | DATA   | DATA   | DATA   | DATA   |  ...  | DATA   |  <- remaining 456 blocks: data
 +--------+--------+--------+--------+--------+       +--------+
-| ...    | ...                                       | ...    |
-+--------+                                           +--------+
 ```
 
 - Sync pattern: `10101100` (8 bits, fixed). Used to validate frames and reject corrupted ones.
 - Frame index: big-endian integer, 16-bit by default. Encoder switches to 32-bit when needed (hard limit).
-  When 32-bit is used, the index continues into the next blocks and data capacity per frame shrinks.
 - Data: 456 bits (16-bit index) or 440 bits (32-bit index) of Reed-Solomon encoded payload per frame.
 
-The first 1 second (`METADATA_DURATION_SEC`) in the video is reserved for QR metadata
-and does **not** contain data blocks. The decoder uses these frames to learn the
-expected ECC length, frame count, and SHA256 before assembling payload data.
-QR metadata also carries the frame index width (`i`) along with filename, size,
-ECC length, and metadata frame count.
+The first 1 second is reserved for QR metadata and does **not** contain data blocks. The
+decoder uses these frames to learn the expected ECC length, frame count, frame index width,
+and SHA256 before assembling payload data.
 
-Each block is sampled at its center 32×32 region (the inner half, margin = 16px). Block edges are where DCT compression artifacts accumulate; the center is clean.
+Each block is sampled at its center 32×32 region (margin = 16px). Block edges are where DCT
+compression artifacts accumulate; the center is clean.
 
 ### Audio channel
 
@@ -96,7 +110,10 @@ Frequencies:     1000 Hz = 00
                  1600 Hz = 11
 ```
 
-Tones are generated in batch via vectorized numpy, one symbol per 441 samples at 44100 Hz. The audio carries as many ECC bytes as the video duration allows. Positions are selected using the **distributed** layout: the audio bytes are spaced evenly across the *entire* ECC stream (position 0 through ecc\_len−1) rather than covering only the prefix. This means every audio byte contributes error-correction signal at a different part of the file, giving the decoder useful recovery leverage across the full archive regardless of which region the video channel corrupts.
+The audio carries as many ECC bytes as the video duration allows. Positions use the
+**distributed** layout: audio bytes are spaced evenly across the *entire* ECC stream
+(position 0 through ecc_len−1), so every audio byte contributes error-correction signal at a
+different part of the file.
 
 ### Decoding pipeline
 
@@ -107,68 +124,57 @@ downloaded MP4  (1080p, from yt-dlp)
     |                           |
     v                           v
 [video decode]            [audio decode]
-ffmpeg pipe               ffmpeg PCM pipe
-rgb24 raw frames          44100Hz s16le mono
+libav frames              libav PCM
+1080p luma                44100Hz mono
     |                           |
     v                           v
-decode QR metadata        batch FFT per
-from first 1 second       441-sample window
+decode QR metadata        windowed FFT per
+center-sample blocks      441-sample symbol
+threshold @ 128           argmax over 4 bins
     |                           |
     v                           v
-expected length           argmax over
-frames + SHA256           4 target bins
-    |
-    v
-center-sample
-each 64x64 block
-threshold at 128
-    |
-    v
-sync check
-frame index                 bit stream
+sync check + frame index  bit stream -> bytes
+sort by index, fill gaps
     |                           |
-    v                           v
-sort by index             pack to bytes
-fill gaps with 0s
-    |
     +---------------------------+
                 |
                 v
         [merge strategies]
         1. video-only  (tried first; fastest path for clean local files)
         2. merged      (audio global parity merged at planned ECC positions)
-        3. audio-only  (fallback; only useful if audio covers the whole ECC stream)
+        3. audio-only  (fallback)
                 |
                 v
-        [Reed-Solomon decode]
-                |
-                v
-        [parse payload header]
-        extract filename, size, SHA256
-                |
-                v
-        write file + verify SHA256
+        [Reed-Solomon decode] -> [parse payload] -> write file + verify SHA256
 ```
+
+The video decode opens the container with `ignore_editlist` so every encoded frame is
+returned (the AAC priming delay otherwise adds an edit list that trims the final frame).
 
 ### Why two channels?
 
-H.264/VP9 and Opus fail in structurally different ways:
-
-- H.264/VP9 errors cluster at high-motion boundaries, complex textures, and bitrate-starved regions. A frame with lots of variation near a data block could corrupt that block.
-- Opus errors distribute differently: it uses MDCT and a perceptual model tuned for voice and music. Mid-range tones (1–2 kHz) survive very well, but timing artifacts and transient distortion are different from video blocking artifacts.
-
-A byte corrupted in the video channel has no correlation with whether the same byte survived in the audio channel. RS error correction gets to correct against the union of both error sets, not the intersection, which roughly doubles effective correction capacity for the bytes audio covers.
+H.264/VP9 and Opus fail in structurally different ways, and a byte corrupted in the video
+channel has no correlation with whether the same byte survived in the audio channel. RS error
+correction gets to correct against the union of both error sets, not the intersection.
 
 ---
 
 ## Requirements
 
-- Python 3.10+
-- ffmpeg with libx264 (in PATH)
-- yt-dlp (for downloading encoded videos back from YouTube)
+- Rust toolchain (stable, edition 2021)
+- FFmpeg **development** libraries (libav*), used via the `ffmpeg-next` bindings — **no
+  `ffmpeg` subprocess is spawned**. On Debian/Ubuntu:
+
+  ```
+  sudo apt install libavcodec-dev libavformat-dev libavutil-dev \
+    libavfilter-dev libavdevice-dev libswscale-dev libswresample-dev pkg-config clang
+  ```
+
+  (`clang`/`libclang` is needed by bindgen at build time. Built and tested against FFmpeg 6.1.)
+- `yt-dlp` (only for downloading encoded videos back from YouTube)
 
 ```
-pip install reedsolo numpy qrcode opencv-python-headless
+cargo build --release
 ```
 
 ---
@@ -178,42 +184,54 @@ pip install reedsolo numpy qrcode opencv-python-headless
 ### Encode
 
 ```
-python yt_encode.py <input_file> <output.mp4>
+cargo run --release -- encode <input_file> <output.mp4>
+# or, after building:
+./target/release/framevault encode <input_file> <output.mp4>
 ```
 
-Example:
-
-```
-python yt_encode.py archive.zip archive.zip.mp4
-```
-
-The output is a standard H.264/AAC MP4 file ready to upload to YouTube. Upload it at the highest resolution offered (1080p or above).
+The output is a standard H.264/AAC MP4 ready to upload to YouTube at 1080p or higher.
 
 ### Decode
 
 ```
-python yt_decode.py <video.mp4> [output_dir]
+./target/release/framevault decode <video.mp4> [output_dir]
 ```
 
 Download the video from YouTube first using yt-dlp:
 
 ```
 yt-dlp -f "bestvideo[height=1080][ext=mp4]+bestaudio" https://youtu.be/YOUR_ID -o downloaded.mp4
-python yt_decode.py downloaded.mp4 ./recovered/
+./target/release/framevault decode downloaded.mp4 ./recovered/
 ```
 
-The decoder will print which RS decode strategy succeeded and verify the SHA256 of the recovered file against the stored hash. If SHA256 does not match, it exits non-zero.
+The decoder reports which RS strategy succeeded and verifies the SHA256 of the recovered file
+against the stored hash, exiting non-zero on mismatch.
 
-### Local round-trip test (no YouTube)
-
-To verify the codec works before uploading:
+### Local round-trip test
 
 ```
-python yt_encode.py myfile.bin myfile.mp4
-python yt_decode.py myfile.mp4 ./recovered/
+./target/release/framevault encode myfile.bin myfile.mp4
+./target/release/framevault decode myfile.mp4 ./recovered/
 ```
 
-This tests the full encode/decode cycle locally. If this fails, the issue is in the codec, not YouTube's re-encoding.
+---
+
+## Performance (Rust vs. the Python prototype)
+
+Wall-clock encode + decode of random files, same codec settings (1080p, H.264 CRF 0
+ultrafast, AAC 320k), verified byte-identical both ways. Both implementations ultimately call
+the same libx264/AAC encoders (Rust via libav bindings, Python via the ffmpeg CLI); the Rust
+gains come from generating YUV420P frames directly (no RGB buffer / swscale pass), compiled
+Reed-Solomon, and no Python/numpy/process-pool overhead.
+
+| File size | Rust encode | Rust decode | Python encode | Python decode |
+|-----------|------------:|------------:|--------------:|--------------:|
+| 1 KB      | 0.58 s      | 0.52 s      | 1.80 s        | 1.62 s        |
+| 10 KB     | 2.15 s      | 1.65 s      | 5.03 s        | 2.97 s        |
+| 100 KB    | 15.79 s     | 12.44 s     | 46.04 s       | 15.72 s       |
+
+≈ **2.3–3× faster encode** and **1.3–1.8× faster decode**. Profiling the 100 KB encode showed
+the prototype spent ~35 s in RGB→YUV scaling alone; generating YUV directly cut that to ~2 s.
 
 ---
 
@@ -224,25 +242,10 @@ This tests the full encode/decode cycle locally. If this fails, the issue is in 
 | Frame dimensions | 1920 × 1080 |
 | Block size | 64 × 64 px |
 | Grid | 30 × 16 = 480 blocks/frame |
-| Header bits/frame | 24 (8 sync + 16 index) / 40 (8 sync + 32 index) |
-| Data bits/frame | 456 (16-bit) / 440 (32-bit) |
-| Data bytes/frame | 57 (16-bit) / 55 (32-bit) |
+| Data bits/frame | 456 (16-bit index) / 440 (32-bit index) |
 | Video data rate | 1,710 bytes/sec (16-bit) / 1,650 bytes/sec (32-bit) |
 | Audio data rate | 25 bytes/sec (4-FSK, 100 baud) |
 | ECC overhead | ~14% (RS-32 over GF(2^8)) |
-| Net video throughput | ~1,500 bytes/sec (16-bit) / ~1,450 bytes/sec (32-bit) after ECC |
-| Max video duration | ~36 min (16-bit) / ~4.5 years (32-bit) |
-| Max file size (video) | Scales with index width (16-bit default, 32-bit hard limit) |
-
-Audio capacity is ~1.5% of video capacity at these settings. Audio bytes are sampled from evenly-spaced positions across the **entire** ECC stream (distributed global parity), so even at 1.5% sampling, every region of the file gets an independent error-correction probe.
-
-Audio provides 100% ECC coverage only for files where `ecc_bytes ≤ floor(duration × 25)`. In practice this limits full audio coverage to raw files under ~22 bytes. For anything larger, audio acts as distributed global parity — not full redundancy.
-
-To increase audio coverage: raise `BAUD_RATE` in both scripts. 200 baud doubles coverage with a minor reliability tradeoff; test post-Opus survival before committing.
-
----
-
-## Theoretical limits
 
 ### Maximum file size
 
@@ -251,60 +254,37 @@ To increase audio coverage: raise `BAUD_RATE` in both scripts. 200 baud doubles 
 | **16-bit** (default) | 16 | 57 | 65,536 | 3.56 MB | ~3.11 MB |
 | **32-bit** (auto-selected) | 32 | 55 | 4,294,967,296 | ~220 GB | ~193 GB |
 
-The encoder automatically selects 16-bit when the payload fits in 65,536 frames; otherwise it switches to 32-bit. The 32-bit hard limit corresponds to a video approximately 4.5 years long at 30 fps.
-
-Max raw file = max ECC stream × (223 / 255) — the RS data efficiency ratio (32 ECC symbols per 255-byte block).
-
-### Audio coverage by file size
-
-| Raw file | ECC stream | Video duration | Audio bytes | Audio coverage |
-|----------|-----------|----------------|-------------|----------------|
-| 1 B | 33 B | ~1.0 s | 25 | 75.8% |
-| 22 B | 54 B | ~1.0 s | 25 | 46.3% |
-| 100 B | 132 B | ~1.0 s | 25 | 18.9% |
-| 1 KB | ~1.15 KB | ~1.0 s | 25 | ~2.2% |
-| 10 KB | ~11.5 KB | ~5.7 s | 142 | ~1.2% |
-| 100 KB | ~115 KB | ~57 s | 1,425 | ~1.2% |
-| 1 MB | ~1.15 MB | ~566 s | 14,150 | ~1.2% |
-| ~3.11 MB (max 16-bit) | ~3.56 MB | ~36.4 min | ~54,600 | ~1.5% |
-
-Audio byte count = `min(ecc_len, floor(total_duration_sec × 25))`.
-
-Audio 100% coverage threshold: ECC stream ≤ ~25 bytes (raw file ≤ ~22 bytes). Below this threshold a single 1-second video provides enough audio bandwidth to carry the entire ECC stream in the side channel.
-
-### Audio independence
-
-The audio channel is **fully independent** of the video. Decoding always attempts video-only RS first. Audio is only consulted if the video RS decode fails. A video with no audio stream (or with a completely garbled audio track) will still decode correctly as long as the video channel is intact.
+The encoder automatically selects 16-bit when the payload fits in 65,536 frames; otherwise it
+switches to 32-bit (hard limit, ~4.5 years of video at 30 fps).
 
 ---
 
-## Known limitations
-
-**Frame index ceiling.** The encoder uses 16-bit frame indices by default and automatically switches to 32-bit if the payload needs more than 16-bit indices. 32-bit is the hard limit.
-
-**YouTube re-encoding is untested.** The local round-trip works. YouTube's actual VP9/H.264 output has not yet been tested against this codec. The 64×64 block size was chosen conservatively for this reason. If YouTube's encoder corrupts blocks, the first thing to try is increasing `BLOCK_SIZE` to 128.
-
-**ECC is RS (with erasures for missing frames).** RS handles both errors and erasures. The decoder already treats bytes from sync-failed frames as erasures (known-missing positions) when calling `reedsolo`, which improves recovery vs. pure error correction. Corruption inside frames that still pass sync is still handled as errors.
-
-**Audio coverage is still partial for large files.** The audio track now samples ECC bytes evenly across the entire stream ("global parity"), which is much more useful than prefix-only redundancy, but the channel is still bandwidth-limited. Full redundancy would require a second pass or a higher-bandwidth modulation scheme.
-
-**reedsolo is pure Python.** The scripts now parallelize RS block work across CPU cores, which helps substantially on larger payloads, but a compiled RS library would still be faster.
-
----
-
-## File structure
+## Project structure
 
 ```
-yt_encode.py    encode any file into a YouTube-ready dual-channel video
-yt_decode.py    decode a downloaded video back to the original file
-README.md       this file
+src/
+  constants.rs   shared codec constants
+  rs.rs          Reed-Solomon ECC (reed-solomon crate, rayon-parallel, erasures)
+  frame.rs       frame layout, index<->bits, luma rendering, block sampling
+  audio.rs       4-FSK modulation + FFT demodulation, audio byte placement
+  qr.rs          QR metadata frame generation (qrcode) + decode (rqrr)
+  metadata.rs    payload framing + QR metadata (serde)
+  media.rs       libav encode (mux) / decode (demux) pipeline
+  encode.rs      encode pipeline + report
+  decode.rs      decode pipeline (video-only/merged/audio-only) + report
+  main.rs        clap CLI
+tests/
+  helpers.rs     codec-helper unit tests (no media)
+  roundtrip.rs   real encode -> MP4 -> decode -> verify
+  media_spike.rs low-level libav round-trip
 ```
+
+Run the suite with `cargo test` (the heavy 100 KB round-trip is `#[ignore]`d; run it with
+`cargo test --release -- --ignored`).
 
 ---
 
 ## Payload format (reference)
-
-All encoded videos carry a self-describing payload. No external metadata file is needed.
 
 ```
 Payload layout (before ECC):
@@ -313,45 +293,43 @@ Payload layout (before ECC):
 | metadata length   | UTF-8 JSON metadata        | raw file bytes    |
 +-------------------+---------------------------+-------------------+
 
-Metadata JSON fields:
-  v          encoding version (integer, currently 4)
-  filename   original filename (string)
-  size       original file size in bytes (integer)
-  sha256     SHA256 hex digest of the original file bytes (string)
-  audio_layout  audio redundancy layout stored in the side channel ("distributed")
+Metadata JSON fields: v (version), filename, size, sha256, audio_layout
 ```
-
-The RS-encoded payload is then split into 456-bit chunks, one chunk per video frame. The audio channel carries sampled RS bytes (not the raw payload), spaced evenly across the full ECC stream so that the side channel can help recovery anywhere in the file instead of only at the beginning.
 
 ## QR metadata (first 1 second)
 
-The first 1 second (`METADATA_DURATION_SEC`) is QR codes that carry compact metadata for the decoder:
+```
+{ "v":4, "f":"file.bin", "s":12345, "h":"sha256...", "e":67890,
+  "n":42, "i":16, "m":30, "a":250, "p":"distributed" }
+```
 
-```
-{
-  "v": 4,              // encoding version
-  "f": "file.bin",     // filename
-  "s": 12345,          // size in bytes
-  "h": "sha256...",    // SHA256 hex
-  "e": 67890,          // ECC stream length in bytes
-  "n": 42,             // data frame count
-  "m": 5,              // metadata frame count
-  "a": 250,            // audio bytes written into the side channel
-  "p": "distributed"   // audio layout used by the encoder/decoder
-}
-```
+(version, filename, size, sha256, ECC length, data frame count, index width, metadata frame
+count, audio bytes, audio layout). Long-key aliases are also accepted on decode.
+
+---
 
 ## Parallel processing
 
-`encode.py` and `decode.py` now use concurrent workers for the CPU-heavy parts of the pipeline:
+Reed-Solomon block encode/decode runs across CPU cores via `rayon`. The release profile is
+tuned for speed (`opt-level = 3`, LTO, single codegen unit).
 
-- Reed-Solomon block encode/decode runs in a `ProcessPoolExecutor`
-- Video frame generation and frame block analysis run concurrently across worker threads
+---
 
-You can cap worker usage with `FRAMEVAULT_WORKERS=<n>` if you want to reduce CPU load.
+## Known limitations
+
+- **YouTube re-encoding is untested.** The local round-trip works; YouTube's actual VP9/H.264
+  output has not yet been tested against this codec. The 64×64 block size was chosen
+  conservatively for this reason.
+- **Audio coverage is partial for large files.** The audio track samples ECC bytes evenly
+  across the whole stream (global parity), but is bandwidth-limited (~25 bytes/sec).
+- **QR detection is single-pass** (`rqrr`), unlike the prototype's multi-scale OpenCV + pyzbar
+  fallback. For clean local round-trips this is sufficient, and the payload header provides a
+  fallback when QR metadata is unavailable.
 
 ---
 
 ## Why this is free and not abuse
 
-YouTube does not charge for storage or bandwidth on uploaded videos. There is no rate limit on uploads for verified accounts. No free trial is being exploited. The videos are valid H.264/AAC MP4 files and conform to YouTube's technical upload requirements. Whether YouTube's terms of service cover this use case is a separate question outside the scope of this study.
+YouTube does not charge for storage or bandwidth on uploaded videos. The output files are
+valid H.264/AAC MP4s conforming to YouTube's technical upload requirements. Whether YouTube's
+terms of service cover this use case is a separate question outside the scope of this study.
