@@ -30,6 +30,13 @@ anyhow = "1"
 # libav bindings (no subprocess). Pinned to the 6.1 line to match FFmpeg 6.1.x.
 ffmpeg-next = "6.1"
 
+# On Windows, statically link FFmpeg (+ libx264) into the binary so no FFmpeg DLLs
+# are shipped. The dev libraries come from vcpkg (x64-windows-static-md); see
+# scripts/setup-windows.ps1 and .cargo/config.toml. Cargo unions this feature with
+# the base dependency above, so non-Windows targets keep dynamic linking.
+[target.'cfg(windows)'.dependencies]
+ffmpeg-next = { version = "6.1", features = ["static"] }
+
 [dev-dependencies]
 tempfile = "3"
 

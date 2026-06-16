@@ -177,6 +177,40 @@ correction gets to correct against the union of both error sets, not the interse
 cargo build --release
 ```
 
+### Building on Windows
+
+On Windows the build links FFmpeg (+ libx264) **statically**, so the resulting
+`framevault.exe` is a self-contained single binary — no FFmpeg DLLs are shipped alongside it.
+The build uses the `x64-windows-static-md` triplet (static libs, dynamic CRT), so the binary
+still depends on the Microsoft Visual C++ runtime (`VCRUNTIME140.dll`) — install the
+[VC++ redistributable](https://aka.ms/vs/17/release/vc_redist.x64.exe) if it isn't already
+present. The static, MSVC-compatible libraries are built by
+[vcpkg](https://github.com/microsoft/vcpkg).
+
+1. Install [LLVM](https://releases.llvm.org/) (provides `libclang.dll` for bindgen).
+2. From the repo root, run:
+
+   ```powershell
+   powershell -ExecutionPolicy Bypass -File scripts/setup-windows.ps1
+   cargo build --release
+   ```
+
+The script clones + bootstraps vcpkg (under `%USERPROFILE%\vcpkg`) and builds
+`ffmpeg[x264]:x64-windows-static-md` (a **slow, one-time, from-source** build — GPL/libx264 is
+required because the encoder uses H.264 CRF 0; vcpkg auto-acquires nasm/cmake/ninja). FFmpeg is
+pinned to **6.1.1** to match the `ffmpeg-next = "6.1"` bindings (FFmpeg 7 removed the channel-layout
+API this code uses) via a committed overlay port at `scripts/vcpkg-overlay/ffmpeg`, layered on
+vcpkg's current baseline so x264 and the build tools still come from live mirrors. The script then
+finds your libclang and writes `.cargo/config.toml` with the resolved `VCPKG_ROOT`,
+`VCPKGRS_TRIPLET`, and `LIBCLANG_PATH`. The `static` feature is enabled for Windows via a
+`[target.'cfg(windows)']` dependency in `Cargo.toml`, so non-Windows builds keep linking FFmpeg
+dynamically. Re-run the script on each machine — `.cargo/config.toml` holds machine-specific
+absolute paths.
+
+> **Note:** the committed `.cargo/config.toml` is Windows-specific (its `[env]` paths apply on
+> every platform). When building on Linux/macOS, delete it first — the system
+> `pkg-config`/`libclang` setup described above needs no config file.
+
 ---
 
 ## Usage
