@@ -12,6 +12,7 @@ use std::path::Path;
 
 use anyhow::{bail, Result};
 
+use crate::budget;
 use crate::constants::*;
 use crate::frame::{frame_layout, make_frame_luma, select_index_bits};
 use crate::media;
@@ -69,7 +70,7 @@ impl<R: Read> DataFrameProducer<R> {
     }
 }
 
-pub fn encode(input_path: &Path, output_path: &Path) -> Result<EncodeReport> {
+pub fn encode(input_path: &Path, output_path: &Path, memory: Option<&str>) -> Result<EncodeReport> {
     // ---- [1/4] pass 1: stream-hash the file + build metadata ----
     println!("[1/4] Reading file: {}", input_path.display());
     let meta = build_meta(input_path)?;
@@ -91,11 +92,18 @@ pub fn encode(input_path: &Path, output_path: &Path) -> Result<EncodeReport> {
     let total_frames = num_data_frames + METADATA_FRAMES;
     let duration_sec = total_frames as f64 / FRAME_RATE as f64;
 
+    let budget_bytes = budget::resolve_budget_bytes(memory)?;
+    let batch_blocks = budget::blocks_for_budget(budget_bytes);
+
     println!("\n[2/4] Plan");
     println!("      ECC stream:     {ecc_len} bytes");
     println!("      Data frames:    {num_data_frames}");
     println!("      Total frames:   {total_frames} @ {FRAME_RATE}fps ({duration_sec:.1}s)");
     println!("      Frame index:    {index_bits} bits");
+    println!(
+        "      Memory budget:  {} MiB ({batch_blocks} RS blocks/batch)",
+        budget_bytes / (1024 * 1024)
+    );
 
     let qr_payload = build_qr_metadata(&meta, ecc_len, num_data_frames as u64, index_bits);
     let qr_luma = make_qr_luma(&qr_payload)?;
@@ -114,8 +122,11 @@ pub fn encode(input_path: &Path, output_path: &Path) -> Result<EncodeReport> {
     // ---- [3/4] pass 2: stream RS-encode + render frames, muxing via libav ----
     println!("\n[3/4] Generating frames, muxing via libav...");
     let payload_reader = Cursor::new(header).chain(BufReader::new(File::open(input_path)?));
-    let mut producer =
-        DataFrameProducer::new(StreamingEcc::new(payload_reader), data_bytes_per_frame, index_bits);
+    let mut producer = DataFrameProducer::new(
+        StreamingEcc::new(payload_reader, batch_blocks),
+        data_bytes_per_frame,
+        index_bits,
+    );
     let make_luma = move |idx: usize| -> Result<Vec<u8>> {
         if idx < METADATA_FRAMES {
             Ok(qr_luma.clone())

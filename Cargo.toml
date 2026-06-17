@@ -24,6 +24,10 @@ sha2 = "0.10"
 # CLI.
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
+# System RAM detection, for the default memory budget (n% of total RAM).
+sysinfo = "0.32"
+# Atomic-rename output files (decode streams straight to a temp file, then persists it).
+tempfile = "3"
 
 # libav bindings (no subprocess). Pinned to the 6.1 line to match FFmpeg 6.1.x.
 ffmpeg-next = "6.1"
@@ -34,9 +38,6 @@ ffmpeg-next = "6.1"
 # the base dependency above, so non-Windows targets keep dynamic linking.
 [target.'cfg(windows)'.dependencies]
 ffmpeg-next = { version = "6.1", features = ["static"] }
-
-[dev-dependencies]
-tempfile = "3"
 
 [profile.release]
 opt-level = 3       # optimize for speed (not size)

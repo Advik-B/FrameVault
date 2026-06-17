@@ -35,6 +35,7 @@ fn libav_video_round_trip() {
         if let Some(decoded) = decode_frame(&bits, index_bits, header_bits) {
             got.push(decoded);
         }
+        Ok(())
     })
     .expect("decode video");
 

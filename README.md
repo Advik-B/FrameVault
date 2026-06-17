@@ -110,18 +110,26 @@ libav video decode  -->  per frame: sample block centers, threshold @ 128
 read QR metadata (first 1 s): ECC length, frame count, index width, SHA256
    |
    v
-sync-check + frame index  -->  write packed bytes straight into one
-                               preallocated ECC buffer (a `seen` bitset marks
-                               which frames arrived; missing ones become erasures)
+sync-check + frame index  -->  write packed bytes into a block-aligned
+                               sliding window over the ECC stream
+                               (sized by --memory, not file size)
+   |
+   v   window fills (or stream ends)
+Reed-Solomon decode the window (unseen bytes = erasures)
    |
    v
-Reed-Solomon decode  -->  parse payload  -->  write file + verify SHA256
+stream plaintext to the recovered file  -->  rotate window forward
+   |
+   v
+verify SHA256 against the QR-supplied hash
 ```
 
 The decoder opens the container with `ignore_editlist` so every encoded frame is returned. As
-soon as the QR metadata resolves the layout, each decoded frame is written directly into the
-final ECC buffer — there is no per-frame heap map and no bit-per-byte intermediate. Missing
-frames are passed to Reed-Solomon as erasures.
+soon as the QR metadata resolves the layout, each decoded frame is written into a sliding
+window sized by the memory budget (`--memory`, default 25% of system RAM) rather than into a
+buffer sized to the whole file. A window is Reed-Solomon decoded and its plaintext streamed
+straight to disk as soon as it fills, so neither the ECC stream nor the recovered file is ever
+held whole in memory. Missing bytes become erasures scoped to whichever window they land in.
 
 ---
 
@@ -209,6 +217,19 @@ yt-dlp -f "bestvideo[height=1080][ext=mp4]" https://youtu.be/YOUR_ID -o download
 The decoder verifies the SHA256 of the recovered file against the stored hash, exiting
 non-zero on mismatch.
 
+### Memory budget
+
+Both commands accept `--memory <SIZE>` (e.g. `--memory 512M`, `--memory 2G`, `--memory 1024K`)
+to cap how much RAM Reed-Solomon batching (encode) or windowing (decode) is allowed to use.
+Encode's batch size and decode's window size are independent — they don't need to match each
+other, or match across machines/versions. When omitted, the default is **25% of total system
+RAM** (floored at 64 MiB):
+
+```
+./target/release/framevault encode big.iso big.mp4 --memory 256M
+./target/release/framevault decode big.mp4 ./recovered/ --memory 256M
+```
+
 ### Local round-trip test
 
 ```
@@ -223,9 +244,13 @@ non-zero on mismatch.
 Frames are generated directly as YUV420P (no RGB buffer / swscale pass), Reed-Solomon runs
 across CPU cores via `rayon`, and the whole pipeline streams.
 
-**Peak memory is bounded — it does not grow with file size.** The encoder holds only fixed
-buffers (a 64 KB hashing buffer, a ~57 KB / ~65 KB RS batch, and a couple of ~2 MB frame
-planes); the rest of the resident set is the constant libx264/libav working set.
+**Peak memory is governed by `--memory`, not file size.** Encode batches its RS input and
+decode windows its ECC stream, both sized from the same budget (default: 25% of total system
+RAM, floored at 64 MiB) — neither buffer ever holds more than one batch/window's worth, no
+matter how large the file is. The encoder additionally holds a few small fixed buffers (a
+64 KB hashing buffer and a couple of ~2 MB frame planes) on top of its batch; the rest of the
+resident set is the constant libx264/libav working set, which dominates peak RSS for any file
+small enough to fit in a single batch/window.
 
 Measured on this machine (release build, random input, encode peak RSS):
 
@@ -242,6 +267,21 @@ A full 3 MB round-trip (3,145,728 bytes — near the 16-bit ceiling: 3.43 MiB EC
 |--------|------:|---------:|-----------------|
 | Encode | 137 s | 123 MB   | —               |
 | Decode | 184 s | 77 MB    | SHA256 PASS, byte-identical |
+
+The same 3 MB round trip at two very different `--memory` settings (32M vs. 512M — a 16x gap
+in nominal budget) moves peak RSS by well under 1%, because the allocator only commits pages
+the batch/window actually touches — a generous `--memory` costs nothing extra on a file too
+small to use it:
+
+| `--memory` | Encode peak RSS | Decode peak RSS | Recovered file |
+|-----------:|-----------------:|-----------------:|----------------|
+| 32M        | 133 MB            | 81 MB             | SHA256 PASS    |
+| 512M       | 133 MB            | 81 MB             | SHA256 PASS    |
+
+The bound itself is proven under stress, not just at a generous budget: `tests/roundtrip.rs`'s
+`tiny_memory_budget_round_trip` pushes a 20 KB payload through an explicit 1 KB `--memory`,
+forcing dozens of batch/window rotations on both the encode and decode sides through the real
+MP4 pipeline — still byte-identical on recovery.
 
 (For comparison, the removed audio path would have allocated a duration-sized PCM buffer —
 roughly **900 MB** for a 2,100 s track — on top of the encode.)

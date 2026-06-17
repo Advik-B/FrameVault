@@ -1,14 +1,14 @@
 //! Streaming Reed-Solomon ECC: adapts a payload byte stream (`io::Read`) into the ECC
 //! byte stream produced by [`ecc_encode`], without materializing either in full.
 //!
-//! Each refill reads exactly `RS_DATA_BYTES * RS_STREAM_BATCH_BLOCKS` payload bytes (a
-//! multiple of the 223-byte RS data block) unless the source is exhausted, so only the
-//! final batch is ever short. That block-alignment is what guarantees the concatenated
-//! streamed output is byte-for-byte identical to `ecc_encode` over the whole payload.
+//! Each refill reads exactly `RS_DATA_BYTES * batch_blocks` payload bytes (a multiple of
+//! the 223-byte RS data block) unless the source is exhausted, so only the final batch is
+//! ever short. That block-alignment is what guarantees the concatenated streamed output is
+//! byte-for-byte identical to `ecc_encode` over the whole payload.
 
 use std::io::{self, Read};
 
-use crate::constants::{RS_DATA_BYTES, RS_STREAM_BATCH_BLOCKS};
+use crate::constants::RS_DATA_BYTES;
 use crate::rs::ecc_encode;
 
 /// Wraps a payload reader and yields the ECC stream via [`Read`].
@@ -21,10 +21,13 @@ pub struct StreamingEcc<R: Read> {
 }
 
 impl<R: Read> StreamingEcc<R> {
-    pub fn new(inner: R) -> Self {
+    /// `batch_blocks` (the caller's memory budget in `RS_BLOCK_SIZE` units, see
+    /// `budget.rs`; clamped to >= 1) sets how many RS data blocks are read and encoded
+    /// per refill.
+    pub fn new(inner: R, batch_blocks: usize) -> Self {
         Self {
             inner,
-            in_buf: vec![0u8; RS_DATA_BYTES * RS_STREAM_BATCH_BLOCKS],
+            in_buf: vec![0u8; RS_DATA_BYTES * batch_blocks.max(1)],
             ecc: Vec::new(),
             pos: 0,
             eof: false,
@@ -85,8 +88,8 @@ mod tests {
     use super::*;
     use std::io::Cursor;
 
-    fn stream_all(payload: &[u8]) -> Vec<u8> {
-        let mut s = StreamingEcc::new(Cursor::new(payload.to_vec()));
+    fn stream_all(payload: &[u8], batch_blocks: usize) -> Vec<u8> {
+        let mut s = StreamingEcc::new(Cursor::new(payload.to_vec()), batch_blocks);
         let mut out = Vec::new();
         io::copy(&mut s, &mut out).expect("stream ecc");
         out
@@ -94,24 +97,33 @@ mod tests {
 
     #[test]
     fn streaming_matches_one_shot() {
-        let batch = RS_DATA_BYTES * RS_STREAM_BATCH_BLOCKS;
-        let sizes = [
-            0usize,
-            1,
-            222,
-            223,
-            224,
-            255,
-            batch - 1,
-            batch,
-            batch + 1,
-            2 * batch,
-            2 * batch + 7,
-            3 * batch + RS_DATA_BYTES + 5,
-        ];
-        for &n in &sizes {
-            let payload: Vec<u8> = (0..n).map(|i| (i * 31 + 7) as u8).collect();
-            assert_eq!(stream_all(&payload), ecc_encode(&payload), "ecc mismatch at n={n}");
+        // Cross a few batch sizes (including the previous hardcoded default of 256) with
+        // a range of payload sizes, proving the block-alignment invariant holds regardless
+        // of the caller's memory budget.
+        for &batch_blocks in &[1usize, 4, 256] {
+            let batch = RS_DATA_BYTES * batch_blocks;
+            let sizes = [
+                0usize,
+                1,
+                222,
+                223,
+                224,
+                255,
+                batch - 1,
+                batch,
+                batch + 1,
+                2 * batch,
+                2 * batch + 7,
+                3 * batch + RS_DATA_BYTES + 5,
+            ];
+            for &n in &sizes {
+                let payload: Vec<u8> = (0..n).map(|i| (i * 31 + 7) as u8).collect();
+                assert_eq!(
+                    stream_all(&payload, batch_blocks),
+                    ecc_encode(&payload),
+                    "ecc mismatch at n={n}, batch_blocks={batch_blocks}"
+                );
+            }
         }
     }
 }

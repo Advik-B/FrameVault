@@ -23,10 +23,6 @@ pub const MAX_FRAME_COUNT_EXTENDED: u64 = MAX_FRAME_INDEX + 1; // 1 << 32
 pub const RS_ECC_SYMBOLS: usize = 32; // ECC bytes per 255-byte RS block
 pub const RS_DATA_BYTES: usize = 255 - RS_ECC_SYMBOLS; // 223
 pub const RS_BLOCK_SIZE: usize = RS_DATA_BYTES + RS_ECC_SYMBOLS; // 255
-/// RS data blocks per streaming-encode batch. Each batch reads
-/// `RS_DATA_BYTES * RS_STREAM_BATCH_BLOCKS` bytes (~57 KB) and emits ~65 KB of ECC,
-/// keeping memory bounded while staying >= `PARALLEL_RS_MIN_BLOCKS` for rayon.
-pub const RS_STREAM_BATCH_BLOCKS: usize = 256;
 
 // ---- Parallelism ----
 pub const PARALLEL_RS_MIN_BLOCKS: usize = 4;

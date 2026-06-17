@@ -127,9 +127,12 @@ fn drain_video(
 
 /// Decode the video stream of `input`, scaling each frame to a tightly-packed
 /// 1920x1080 rgb24 buffer and passing it (in order) to `on_frame`.
+///
+/// `on_frame` returning `Err` (e.g. a windowed RS-decode or disk I/O failure) aborts the
+/// demux/decode loop and propagates out, mirroring `encode_to_file`'s `make_luma`.
 pub fn decode_video_frames<F>(input: &Path, mut on_frame: F) -> Result<()>
 where
-    F: FnMut(&[u8]),
+    F: FnMut(&[u8]) -> Result<()>,
 {
     ff_init()?;
     // Ignore the container edit list (created for the AAC priming delay) so the
@@ -174,7 +177,7 @@ fn drain_decoded_video<F>(
     on_frame: &mut F,
 ) -> Result<()>
 where
-    F: FnMut(&[u8]),
+    F: FnMut(&[u8]) -> Result<()>,
 {
     let mut decoded = frame::Video::empty();
     while decoder.receive_frame(&mut decoded).is_ok() {
@@ -186,7 +189,7 @@ where
             buf[y * RGB_STRIDE..(y + 1) * RGB_STRIDE]
                 .copy_from_slice(&data[y * stride..y * stride + RGB_STRIDE]);
         }
-        on_frame(buf);
+        on_frame(buf)?;
     }
     Ok(())
 }

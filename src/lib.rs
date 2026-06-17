@@ -3,6 +3,7 @@
 //!
 //! Pure Rust port of the original Python implementation.
 
+pub mod budget;
 pub mod constants;
 pub mod rs;
 pub mod frame;

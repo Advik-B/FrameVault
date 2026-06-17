@@ -2,11 +2,13 @@
 //! encode.py / decode.py.
 
 use std::fs::File;
-use std::io::{BufReader, Read};
-use std::path::Path;
+use std::io::{self, BufReader, BufWriter, Read, Write};
+use std::path::{Path, PathBuf};
 
+use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use tempfile::NamedTempFile;
 
 use crate::constants::{ENCODING_VERSION, METADATA_FRAMES};
 
@@ -19,13 +21,18 @@ pub struct Meta {
     pub sha256: String,
 }
 
-/// Lowercase hex SHA-256 digest.
-pub fn sha256_hex(data: &[u8]) -> String {
+/// Lowercase hex-encode a digest (or any byte sequence).
+fn hex_digest(bytes: impl IntoIterator<Item = u8>) -> String {
     let mut s = String::with_capacity(64);
-    for b in Sha256::digest(data) {
+    for b in bytes {
         s.push_str(&format!("{b:02x}"));
     }
     s
+}
+
+/// Lowercase hex SHA-256 digest.
+pub fn sha256_hex(data: &[u8]) -> String {
+    hex_digest(Sha256::digest(data))
 }
 
 /// Build the [`Meta`] for a file by streaming it: size from the filesystem, SHA-256
@@ -49,10 +56,7 @@ pub fn build_meta(path: &Path) -> std::io::Result<Meta> {
         }
         hasher.update(&buf[..n]);
     }
-    let mut sha256 = String::with_capacity(64);
-    for b in hasher.finalize() {
-        sha256.push_str(&format!("{b:02x}"));
-    }
+    let sha256 = hex_digest(hasher.finalize());
 
     Ok(Meta {
         v: ENCODING_VERSION,
@@ -147,6 +151,128 @@ pub fn parse_qr_meta(json: &str) -> Option<QrMeta> {
         Some(meta)
     } else {
         None
+    }
+}
+
+/// Tracks progress through the embedded payload header (`[4-byte BE meta length][meta
+/// JSON]`) so [`PayloadSink::feed`] can skip it without parsing it. By the time decode
+/// reaches the windowed path, QR metadata has already supplied filename/size/sha256 —
+/// see `parse_qr_meta`'s required-fields gate above — so the header's own copy of that
+/// information is redundant and only its length matters.
+enum HeaderState {
+    ReadingLenPrefix { have: Vec<u8> },
+    SkippingMeta { remaining: usize },
+    Streaming,
+}
+
+/// Streams RS-decoded plaintext straight to disk: skips the embedded payload header,
+/// then writes the remaining file bytes to a temp file in `output_dir` while
+/// incrementally SHA-256 hashing them. Never holds the recovered file whole in memory.
+pub struct PayloadSink {
+    state: HeaderState,
+    writer: BufWriter<NamedTempFile>,
+    hasher: Sha256,
+    bytes_written: u64,
+    remaining_file_bytes: u64,
+    out_path: PathBuf,
+}
+
+impl PayloadSink {
+    pub fn new(output_dir: &Path, filename: &str, expected_size: u64) -> io::Result<Self> {
+        // Created inside `output_dir` (not the system temp dir) so `FinishedPayload::persist`'s
+        // rename stays on the same filesystem.
+        let tmp = NamedTempFile::new_in(output_dir)?;
+        Ok(Self {
+            state: HeaderState::ReadingLenPrefix { have: Vec::with_capacity(4) },
+            writer: BufWriter::new(tmp),
+            hasher: Sha256::new(),
+            bytes_written: 0,
+            remaining_file_bytes: expected_size,
+            out_path: output_dir.join(filename),
+        })
+    }
+
+    /// Feed the next chunk of RS-decoded plaintext, in stream order. A single chunk may
+    /// straddle the len-prefix/meta/file boundaries arbitrarily, since window sizes don't
+    /// align to header sizes. Bytes beyond `expected_size` (the final frame's zero-pad)
+    /// are silently dropped.
+    pub fn feed(&mut self, mut chunk: &[u8]) -> Result<()> {
+        while !chunk.is_empty() {
+            match std::mem::replace(&mut self.state, HeaderState::Streaming) {
+                HeaderState::ReadingLenPrefix { mut have } => {
+                    let take = (4 - have.len()).min(chunk.len());
+                    have.extend_from_slice(&chunk[..take]);
+                    chunk = &chunk[take..];
+                    self.state = if have.len() == 4 {
+                        let meta_len = u32::from_be_bytes([have[0], have[1], have[2], have[3]]);
+                        HeaderState::SkippingMeta { remaining: meta_len as usize }
+                    } else {
+                        HeaderState::ReadingLenPrefix { have }
+                    };
+                }
+                HeaderState::SkippingMeta { remaining } => {
+                    let skip = remaining.min(chunk.len());
+                    chunk = &chunk[skip..];
+                    let remaining = remaining - skip;
+                    self.state = if remaining == 0 {
+                        HeaderState::Streaming
+                    } else {
+                        HeaderState::SkippingMeta { remaining }
+                    };
+                }
+                HeaderState::Streaming => {
+                    let take = (chunk.len() as u64).min(self.remaining_file_bytes) as usize;
+                    if take == 0 {
+                        self.state = HeaderState::Streaming;
+                        break; // rest of `chunk` is trailing zero-pad past the file's end
+                    }
+                    self.writer.write_all(&chunk[..take])?;
+                    self.hasher.update(&chunk[..take]);
+                    self.bytes_written += take as u64;
+                    self.remaining_file_bytes -= take as u64;
+                    chunk = &chunk[take..];
+                    self.state = HeaderState::Streaming;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Flush to disk; consumes self and returns the computed digest + a handle that can
+    /// rename the temp file into place.
+    pub fn finish(mut self) -> Result<FinishedPayload> {
+        self.writer.flush()?;
+        let tmp = self
+            .writer
+            .into_inner()
+            .map_err(|e| anyhow!("flush recovered file: {e}"))?;
+        Ok(FinishedPayload {
+            sha256: hex_digest(self.hasher.finalize()),
+            bytes_written: self.bytes_written,
+            tmp,
+            out_path: self.out_path,
+        })
+    }
+}
+
+/// A fully-written, hashed recovered file, still sitting in a temp file pending
+/// [`FinishedPayload::persist`].
+pub struct FinishedPayload {
+    pub sha256: String,
+    pub bytes_written: u64,
+    tmp: NamedTempFile,
+    out_path: PathBuf,
+}
+
+impl FinishedPayload {
+    /// Rename into place. Called whether or not the hash matched (mirrors the prior
+    /// in-memory decoder's behavior of writing the recovered file before checking/bailing
+    /// on a mismatch, so a corrupted result is still left for inspection). On a hard error
+    /// before this point (RS failure, I/O error), the temp file is instead cleaned up
+    /// automatically by `NamedTempFile`'s `Drop`, leaving no partial output behind.
+    pub fn persist(self) -> Result<PathBuf> {
+        self.tmp.persist(&self.out_path)?;
+        Ok(self.out_path)
     }
 }
 
