@@ -44,6 +44,20 @@ pub fn ecc_encode(data: &[u8]) -> Vec<u8> {
     blocks.concat()
 }
 
+/// Length in bytes of the ECC stream [`ecc_encode`] produces for a `payload_len`-byte
+/// payload — a pure function of the length, so the frame layout can be planned before
+/// any bytes are read. Each full 223-byte data block becomes 255 bytes; a short final
+/// block of `r` bytes becomes `r + 32`.
+pub fn ecc_len_for(payload_len: usize) -> usize {
+    let full = payload_len / RS_DATA_BYTES;
+    let last = payload_len % RS_DATA_BYTES;
+    if last == 0 {
+        full * RS_BLOCK_SIZE
+    } else {
+        full * RS_BLOCK_SIZE + last + RS_ECC_SYMBOLS
+    }
+}
+
 /// Reed-Solomon decode the ECC stream back into the original data. Each 255-byte
 /// block is decoded independently; `erasures` are absolute byte positions in the
 /// whole stream that are known-missing (mapped to per-block offsets). Returns an
@@ -103,23 +117,12 @@ pub fn rs_decode(data: &[u8], erasures: Option<&[usize]>) -> Result<Vec<u8>, Ree
 mod tests {
     use super::*;
 
-    /// Mirror of the Python test helper `_expected_ecc_size`.
-    fn expected_ecc_size(n: usize) -> usize {
-        let full = n / RS_DATA_BYTES;
-        let last = n % RS_DATA_BYTES;
-        if last == 0 {
-            full * RS_BLOCK_SIZE
-        } else {
-            full * RS_BLOCK_SIZE + last + RS_ECC_SYMBOLS
-        }
-    }
-
     #[test]
     fn round_trip_various_sizes() {
         for &n in &[1usize, 22, 100, 222, 223, 224, 255, 446, 500, 1000, 5000, 100 * 1024] {
             let data: Vec<u8> = (0..n).map(|i| (i % 256) as u8).collect();
             let ecc = ecc_encode(&data);
-            assert_eq!(ecc.len(), expected_ecc_size(n), "ecc size for {n} bytes");
+            assert_eq!(ecc.len(), ecc_len_for(n), "ecc size for {n} bytes");
             let recovered = rs_decode(&ecc, None).expect("decode");
             assert_eq!(recovered, data, "round trip for {n} bytes");
         }

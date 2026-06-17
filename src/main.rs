@@ -18,12 +18,16 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Encode a file into a dual-channel (video blocks + audio FSK) MP4.
+    /// Encode a file into a FrameVault MP4 (video block channel).
     Encode {
         /// Input file to encode.
         input: PathBuf,
         /// Output MP4 path.
         output: PathBuf,
+        /// Memory budget for RS encoding (e.g. "512M", "2G"). Defaults to 25% of total
+        /// system RAM.
+        #[arg(long)]
+        memory: Option<String>,
     },
     /// Decode a FrameVault MP4 back into the original file.
     Decode {
@@ -32,18 +36,22 @@ enum Command {
         /// Directory to write the recovered file into.
         #[arg(default_value = ".")]
         output_dir: PathBuf,
+        /// Memory budget for RS decoding (e.g. "512M", "2G"). Defaults to 25% of total
+        /// system RAM.
+        #[arg(long)]
+        memory: Option<String>,
     },
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Command::Encode { input, output } => {
-            framevault::encode::encode(&input, &output)?;
+        Command::Encode { input, output, memory } => {
+            framevault::encode::encode(&input, &output, memory.as_deref())?;
         }
-        Command::Decode { video, output_dir } => {
+        Command::Decode { video, output_dir, memory } => {
             std::fs::create_dir_all(&output_dir)?;
-            let report = framevault::decode::decode(&video, &output_dir)?;
+            let report = framevault::decode::decode(&video, &output_dir, memory.as_deref())?;
             println!(
                 "\nDone. '{}' recovered successfully ({:?} strategy).",
                 report.filename, report.strategy

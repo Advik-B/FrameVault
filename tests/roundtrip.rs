@@ -1,9 +1,8 @@
 //! Port of the Python `test_roundtrip.py`: real encode -> MP4 -> decode -> verify
-//! round-trips through the libav pipeline, plus audio-independence checks.
+//! round-trips through the libav pipeline.
 
 use framevault::decode::{decode, DecodeReport, Strategy};
 use framevault::encode::{encode, EncodeReport};
-use framevault::media;
 
 /// Deterministic pseudo-random bytes (xorshift64).
 fn pseudo_random(n: usize, seed: u64) -> Vec<u8> {
@@ -18,7 +17,11 @@ fn pseudo_random(n: usize, seed: u64) -> Vec<u8> {
         .collect()
 }
 
-fn round_trip(data: &[u8], filename: &str) -> (Vec<u8>, EncodeReport, DecodeReport) {
+fn round_trip_with_memory(
+    data: &[u8],
+    filename: &str,
+    memory: Option<&str>,
+) -> (Vec<u8>, EncodeReport, DecodeReport) {
     let tmp = tempfile::tempdir().unwrap();
     let infile = tmp.path().join(filename);
     let video = tmp.path().join("out.mp4");
@@ -26,11 +29,15 @@ fn round_trip(data: &[u8], filename: &str) -> (Vec<u8>, EncodeReport, DecodeRepo
     std::fs::create_dir_all(&recdir).unwrap();
     std::fs::write(&infile, data).unwrap();
 
-    let enc = encode(&infile, &video).expect("encode");
+    let enc = encode(&infile, &video, memory).expect("encode");
     assert!(video.exists(), "encoder produced no MP4");
-    let dec = decode(&video, &recdir).expect("decode");
+    let dec = decode(&video, &recdir, memory).expect("decode");
     let recovered = std::fs::read(recdir.join(filename)).expect("recovered file missing");
     (recovered, enc, dec)
+}
+
+fn round_trip(data: &[u8], filename: &str) -> (Vec<u8>, EncodeReport, DecodeReport) {
+    round_trip_with_memory(data, filename, None)
 }
 
 fn assert_round_trip(data: &[u8], filename: &str) {
@@ -112,34 +119,16 @@ fn variety_mixed_binary() {
     assert_round_trip(&data, "mixed.bin");
 }
 
-// ---- audio coverage reported by the encoder ----
+// ---- memory budget ----
 
+// A deliberately tiny explicit `--memory` forces many RS batch/window rotations on both
+// the encode and decode sides through the real MP4 pipeline, proving a small budget
+// doesn't break correctness.
 #[test]
-fn encode_reports_distributed_audio_coverage() {
-    let (_, enc, _) = round_trip(&pseudo_random(2048, 20), "cov.bin");
-    assert_eq!(enc.audio_layout, "distributed");
-    assert!(enc.audio_byte_count > 0);
-    assert!(enc.audio_byte_count <= enc.ecc_len);
-}
-
-// ---- audio independence: video-only decode works without any audio ----
-
-#[test]
-fn decodes_with_no_audio_track() {
-    let data = pseudo_random(2048, 30);
-    let tmp = tempfile::tempdir().unwrap();
-    let infile = tmp.path().join("na.bin");
-    let video = tmp.path().join("orig.mp4");
-    let stripped = tmp.path().join("noaudio.mp4");
-    let recdir = tmp.path().join("rec");
-    std::fs::create_dir_all(&recdir).unwrap();
-    std::fs::write(&infile, &data).unwrap();
-
-    encode(&infile, &video).expect("encode");
-    media::remux_drop_audio(&video, &stripped).expect("strip audio");
-    let dec = decode(&stripped, &recdir).expect("decode no-audio");
-
-    assert_eq!(dec.strategy, Strategy::VideoOnly);
-    assert!(dec.sha_ok);
-    assert_eq!(std::fs::read(recdir.join("na.bin")).unwrap(), data);
+fn tiny_memory_budget_round_trip() {
+    let data = pseudo_random(20 * 1024, 9);
+    let (recovered, enc, dec) = round_trip_with_memory(&data, "tiny_budget.bin", Some("1K"));
+    assert_eq!(recovered, data, "byte-level mismatch under a tiny memory budget");
+    assert!(dec.sha_ok, "SHA mismatch under a tiny memory budget");
+    assert_eq!(enc.index_bits, 16);
 }

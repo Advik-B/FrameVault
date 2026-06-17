@@ -120,9 +120,8 @@ mod tests {
             filename: "round_trip.bin".into(),
             size: 123_456,
             sha256: sha.clone(),
-            audio_layout: AUDIO_LAYOUT.into(),
         };
-        let payload = build_qr_metadata(&meta, 4096, 72, 16, 25, AUDIO_LAYOUT);
+        let payload = build_qr_metadata(&meta, 4096, 72, 16);
         let frame = make_qr_frame(&payload).expect("render qr");
         assert_eq!(frame.len(), FRAME_WIDTH * FRAME_HEIGHT * 3);
 
@@ -133,6 +132,5 @@ mod tests {
         assert_eq!(decoded.ecc_bytes, Some(4096));
         assert_eq!(decoded.frames, Some(72));
         assert_eq!(decoded.index_bits, Some(16));
-        assert_eq!(decoded.audio_bytes, Some(25));
     }
 }
