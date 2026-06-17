@@ -19,28 +19,19 @@ pub const MAX_FRAME_INDEX: u64 = (1u64 << EXTENDED_FRAME_INDEX_BITS) - 1;
 pub const MAX_FRAME_COUNT_DEFAULT: u64 = 1u64 << DEFAULT_FRAME_INDEX_BITS; // 65_536
 pub const MAX_FRAME_COUNT_EXTENDED: u64 = MAX_FRAME_INDEX + 1; // 1 << 32
 
-// ---- Audio (4-FSK) ----
-pub const SAMPLE_RATE: usize = 44_100;
-pub const BAUD_RATE: usize = 100; // symbols/sec
-pub const BITS_PER_SYMBOL: usize = 2;
-pub const SAMPLES_PER_SYMBOL: usize = SAMPLE_RATE / BAUD_RATE; // 441 samples/symbol
-pub const FSK_FREQS: [f64; 4] = [1000.0, 1200.0, 1400.0, 1600.0]; // Hz for symbols 0-3
-pub const BYTES_PER_SEC_AUDIO: usize = (BAUD_RATE * BITS_PER_SYMBOL) / 8; // 25 bytes/sec
-
 // ---- Reed-Solomon ----
 pub const RS_ECC_SYMBOLS: usize = 32; // ECC bytes per 255-byte RS block
 pub const RS_DATA_BYTES: usize = 255 - RS_ECC_SYMBOLS; // 223
 pub const RS_BLOCK_SIZE: usize = RS_DATA_BYTES + RS_ECC_SYMBOLS; // 255
+/// RS data blocks per streaming-encode batch. Each batch reads
+/// `RS_DATA_BYTES * RS_STREAM_BATCH_BLOCKS` bytes (~57 KB) and emits ~65 KB of ECC,
+/// keeping memory bounded while staying >= `PARALLEL_RS_MIN_BLOCKS` for rayon.
+pub const RS_STREAM_BATCH_BLOCKS: usize = 256;
 
 // ---- Parallelism ----
 pub const PARALLEL_RS_MIN_BLOCKS: usize = 4;
 pub const PARALLEL_CHUNK_FACTOR: usize = 4;
 pub const FRAME_BATCH_SIZE: usize = 8;
-
-// ---- Audio layout ----
-pub const AUDIO_LAYOUT_PREFIX: &str = "prefix";
-pub const AUDIO_LAYOUT_DISTRIBUTED: &str = "distributed";
-pub const AUDIO_LAYOUT: &str = AUDIO_LAYOUT_DISTRIBUTED;
 
 // ---- Metadata QR ----
 pub const METADATA_DURATION_SEC: f64 = 1.0;
@@ -54,7 +45,7 @@ pub const QR_MIN_MODULE_PX: usize = 6;
 pub const BLOCK_SAMPLE_MARGIN: usize = 16;
 pub const THRESHOLD: f64 = 128.0;
 
-pub const ENCODING_VERSION: u32 = 4;
+pub const ENCODING_VERSION: u32 = 5;
 
 #[cfg(test)]
 mod tests {
@@ -65,8 +56,6 @@ mod tests {
         assert_eq!(COLS, 30);
         assert_eq!(ROWS, 16);
         assert_eq!(TOTAL_BLOCKS, 480);
-        assert_eq!(SAMPLES_PER_SYMBOL, 441);
-        assert_eq!(BYTES_PER_SEC_AUDIO, 25);
         assert_eq!(RS_DATA_BYTES, 223);
         assert_eq!(RS_BLOCK_SIZE, 255);
         assert_eq!(MAX_FRAME_COUNT_DEFAULT, 1 << 16);

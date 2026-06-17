@@ -18,7 +18,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Encode a file into a dual-channel (video blocks + audio FSK) MP4.
+    /// Encode a file into a FrameVault MP4 (video block channel).
     Encode {
         /// Input file to encode.
         input: PathBuf,

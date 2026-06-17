@@ -1,12 +1,14 @@
 //! Payload framing and QR metadata. Mirrors the payload/QR helpers in
 //! encode.py / decode.py.
 
+use std::fs::File;
+use std::io::{BufReader, Read};
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::constants::{AUDIO_LAYOUT, ENCODING_VERSION, METADATA_FRAMES};
+use crate::constants::{ENCODING_VERSION, METADATA_FRAMES};
 
 /// Self-describing payload metadata header (stored before the raw file bytes).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -15,7 +17,6 @@ pub struct Meta {
     pub filename: String,
     pub size: u64,
     pub sha256: String,
-    pub audio_layout: String,
 }
 
 /// Lowercase hex SHA-256 digest.
@@ -27,30 +28,54 @@ pub fn sha256_hex(data: &[u8]) -> String {
     s
 }
 
-/// Build the pre-ECC payload for a file: `[4-byte BE meta length][meta JSON][raw bytes]`.
-pub fn build_payload(path: &Path) -> std::io::Result<(Vec<u8>, Meta)> {
-    let raw = std::fs::read(path)?;
+/// Build the [`Meta`] for a file by streaming it: size from the filesystem, SHA-256
+/// by incremental hashing in fixed-size chunks. Never buffers the whole file, so it
+/// stays bounded in memory regardless of file size.
+pub fn build_meta(path: &Path) -> std::io::Result<Meta> {
     let filename = path
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("file.bin")
         .to_string();
-    let meta = Meta {
+    let size = std::fs::metadata(path)?.len();
+
+    let mut hasher = Sha256::new();
+    let mut reader = BufReader::new(File::open(path)?);
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = reader.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    let mut sha256 = String::with_capacity(64);
+    for b in hasher.finalize() {
+        sha256.push_str(&format!("{b:02x}"));
+    }
+
+    Ok(Meta {
         v: ENCODING_VERSION,
         filename,
-        size: raw.len() as u64,
-        sha256: sha256_hex(&raw),
-        audio_layout: AUDIO_LAYOUT.to_string(),
-    };
-    Ok((assemble_payload(&meta, &raw), meta))
+        size,
+        sha256,
+    })
 }
 
-/// Assemble a payload from already-loaded metadata and raw bytes.
-pub fn assemble_payload(meta: &Meta, raw: &[u8]) -> Vec<u8> {
+/// Serialize just the payload header — `[4-byte BE meta length][meta JSON]` — without
+/// the raw file bytes. The full payload is this header followed by the file's bytes,
+/// which the streaming encoder chains together rather than materializing.
+pub fn serialize_meta_header(meta: &Meta) -> Vec<u8> {
     let meta_bytes = serde_json::to_vec(meta).expect("serialize meta");
-    let mut payload = Vec::with_capacity(4 + meta_bytes.len() + raw.len());
-    payload.extend_from_slice(&(meta_bytes.len() as u32).to_be_bytes());
-    payload.extend_from_slice(&meta_bytes);
+    let mut header = Vec::with_capacity(4 + meta_bytes.len());
+    header.extend_from_slice(&(meta_bytes.len() as u32).to_be_bytes());
+    header.extend_from_slice(&meta_bytes);
+    header
+}
+
+/// Assemble a full payload from metadata and raw bytes: `[header][raw bytes]`.
+pub fn assemble_payload(meta: &Meta, raw: &[u8]) -> Vec<u8> {
+    let mut payload = serialize_meta_header(meta);
     payload.extend_from_slice(raw);
     payload
 }
@@ -97,21 +122,10 @@ pub struct QrMeta {
     pub index_bits: Option<u32>,
     #[serde(rename = "m", alias = "metadata_frames", skip_serializing_if = "Option::is_none")]
     pub metadata_frames: Option<u64>,
-    #[serde(rename = "a", alias = "audio_bytes", skip_serializing_if = "Option::is_none")]
-    pub audio_bytes: Option<u64>,
-    #[serde(rename = "p", alias = "audio_layout", skip_serializing_if = "Option::is_none")]
-    pub audio_layout: Option<String>,
 }
 
 /// Build the compact QR metadata JSON bytes for the decoder.
-pub fn build_qr_metadata(
-    meta: &Meta,
-    ecc_len: usize,
-    num_frames: u64,
-    index_bits: usize,
-    audio_bytes: usize,
-    audio_layout: &str,
-) -> Vec<u8> {
+pub fn build_qr_metadata(meta: &Meta, ecc_len: usize, num_frames: u64, index_bits: usize) -> Vec<u8> {
     let qr = QrMeta {
         version: Some(ENCODING_VERSION),
         filename: Some(meta.filename.clone()),
@@ -121,8 +135,6 @@ pub fn build_qr_metadata(
         frames: Some(num_frames),
         index_bits: Some(index_bits as u32),
         metadata_frames: Some(METADATA_FRAMES as u64),
-        audio_bytes: Some(audio_bytes as u64),
-        audio_layout: Some(audio_layout.to_string()),
     };
     serde_json::to_vec(&qr).expect("serialize qr meta")
 }
@@ -150,7 +162,6 @@ mod tests {
             filename: "x.bin".into(),
             size: raw.len() as u64,
             sha256: sha256_hex(&raw),
-            audio_layout: AUDIO_LAYOUT.into(),
         };
         let payload = assemble_payload(&meta, &raw);
         let (pmeta, pdata) = parse_payload(&payload, None).unwrap();
@@ -162,7 +173,7 @@ mod tests {
 
     #[test]
     fn qr_meta_short_and_long_keys() {
-        let short = r#"{"v":4,"f":"a.bin","s":10,"h":"abc","e":42,"n":1,"i":16,"m":30,"a":25,"p":"distributed"}"#;
+        let short = r#"{"v":5,"f":"a.bin","s":10,"h":"abc","e":42,"n":1,"i":16,"m":30}"#;
         let m = parse_qr_meta(short).expect("short keys");
         assert_eq!(m.filename.as_deref(), Some("a.bin"));
         assert_eq!(m.size, Some(10));
@@ -180,13 +191,12 @@ mod tests {
     #[test]
     fn qr_meta_serializes_short_keys() {
         let meta = Meta {
-            v: 4,
+            v: ENCODING_VERSION,
             filename: "a.bin".into(),
             size: 10,
             sha256: "abc".into(),
-            audio_layout: "distributed".into(),
         };
-        let s = String::from_utf8(build_qr_metadata(&meta, 42, 1, 16, 25, "distributed")).unwrap();
+        let s = String::from_utf8(build_qr_metadata(&meta, 42, 1, 16)).unwrap();
         assert!(s.contains("\"f\":\"a.bin\""));
         assert!(s.contains("\"i\":16"));
         assert!(!s.contains("filename"));

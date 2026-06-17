@@ -1,9 +1,8 @@
 //! Port of the Python `test_roundtrip.py`: real encode -> MP4 -> decode -> verify
-//! round-trips through the libav pipeline, plus audio-independence checks.
+//! round-trips through the libav pipeline.
 
 use framevault::decode::{decode, DecodeReport, Strategy};
 use framevault::encode::{encode, EncodeReport};
-use framevault::media;
 
 /// Deterministic pseudo-random bytes (xorshift64).
 fn pseudo_random(n: usize, seed: u64) -> Vec<u8> {
@@ -110,36 +109,4 @@ fn variety_mixed_binary() {
     data.extend(vec![0xFFu8; 512]);
     data.extend(pseudo_random(512, 7));
     assert_round_trip(&data, "mixed.bin");
-}
-
-// ---- audio coverage reported by the encoder ----
-
-#[test]
-fn encode_reports_distributed_audio_coverage() {
-    let (_, enc, _) = round_trip(&pseudo_random(2048, 20), "cov.bin");
-    assert_eq!(enc.audio_layout, "distributed");
-    assert!(enc.audio_byte_count > 0);
-    assert!(enc.audio_byte_count <= enc.ecc_len);
-}
-
-// ---- audio independence: video-only decode works without any audio ----
-
-#[test]
-fn decodes_with_no_audio_track() {
-    let data = pseudo_random(2048, 30);
-    let tmp = tempfile::tempdir().unwrap();
-    let infile = tmp.path().join("na.bin");
-    let video = tmp.path().join("orig.mp4");
-    let stripped = tmp.path().join("noaudio.mp4");
-    let recdir = tmp.path().join("rec");
-    std::fs::create_dir_all(&recdir).unwrap();
-    std::fs::write(&infile, &data).unwrap();
-
-    encode(&infile, &video).expect("encode");
-    media::remux_drop_audio(&video, &stripped).expect("strip audio");
-    let dec = decode(&stripped, &recdir).expect("decode no-audio");
-
-    assert_eq!(dec.strategy, Strategy::VideoOnly);
-    assert!(dec.sha_ok);
-    assert_eq!(std::fs::read(recdir.join("na.bin")).unwrap(), data);
 }

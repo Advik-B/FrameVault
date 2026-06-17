@@ -1,17 +1,24 @@
-//! Encode pipeline: file -> payload -> RS ECC -> QR + video frames + audio FSK ->
-//! libav MP4. Mirrors `encode()` in encode.py.
+//! Encode pipeline: file -> `[meta header | raw bytes]` payload -> streaming RS ECC ->
+//! QR + video frames -> libav MP4.
+//!
+//! Two passes over the file, so neither the file nor the ECC stream is ever held whole
+//! in memory: pass 1 stream-hashes the file to build the metadata and plan the layout
+//! (every size is a pure function of file size + filename); pass 2 chains the header and
+//! file bytes through a [`StreamingEcc`] and renders frames on demand.
 
+use std::fs::File;
+use std::io::{BufReader, Cursor, Read};
 use std::path::Path;
 
 use anyhow::{bail, Result};
 
-use crate::audio::{make_audio_pcm, select_audio_bytes};
 use crate::constants::*;
-use crate::frame::{frame_layout, frames_needed, make_frame_luma};
+use crate::frame::{frame_layout, make_frame_luma, select_index_bits};
 use crate::media;
-use crate::metadata::{build_payload, build_qr_metadata};
+use crate::metadata::{build_meta, build_qr_metadata, serialize_meta_header};
 use crate::qr::make_qr_luma;
-use crate::rs::ecc_encode;
+use crate::rs::ecc_len_for;
+use crate::stream::StreamingEcc;
 
 /// Summary of an encode run (also drives test assertions).
 #[derive(Debug, Clone)]
@@ -24,110 +31,100 @@ pub struct EncodeReport {
     pub num_data_frames: usize,
     pub total_frames: usize,
     pub duration_sec: f64,
-    pub audio_byte_count: usize,
-    pub audio_layout: String,
+}
+
+/// Pulls fixed-size frames of packed ECC bytes from a [`StreamingEcc`] and renders each
+/// to a luma plane. The final short frame is zero-padded — matching the old encoder's
+/// padding of the bit stream to a whole number of frames.
+struct DataFrameProducer<R: Read> {
+    ecc: StreamingEcc<R>,
+    index_bits: usize,
+    emitted: usize,
+    buf: Vec<u8>,
+}
+
+impl<R: Read> DataFrameProducer<R> {
+    fn new(ecc: StreamingEcc<R>, data_bytes_per_frame: usize, index_bits: usize) -> Self {
+        Self {
+            ecc,
+            index_bits,
+            emitted: 0,
+            buf: vec![0u8; data_bytes_per_frame],
+        }
+    }
+
+    fn next_frame(&mut self) -> Result<Vec<u8>> {
+        let mut filled = 0;
+        while filled < self.buf.len() {
+            let n = self.ecc.read(&mut self.buf[filled..])?;
+            if n == 0 {
+                break; // end of ECC stream: the rest of this frame is zero padding
+            }
+            filled += n;
+        }
+        self.buf[filled..].fill(0);
+        let luma = make_frame_luma(self.emitted as u64, &self.buf, self.index_bits);
+        self.emitted += 1;
+        Ok(luma)
+    }
 }
 
 pub fn encode(input_path: &Path, output_path: &Path) -> Result<EncodeReport> {
-    println!("[1/5] Reading file: {}", input_path.display());
-    let (payload, meta) = build_payload(input_path)?;
+    // ---- [1/4] pass 1: stream-hash the file + build metadata ----
+    println!("[1/4] Reading file: {}", input_path.display());
+    let meta = build_meta(input_path)?;
     println!("      {} | {} bytes", meta.filename, meta.size);
     println!("      SHA256: {}", meta.sha256);
 
-    println!("\n[2/5] Reed-Solomon ECC...");
-    let ecc_data = ecc_encode(&payload);
-    println!("      ECC stream: {} bytes", ecc_data.len());
+    // ---- [2/4] plan the layout (pure function of size + filename) ----
+    let header = serialize_meta_header(&meta);
+    let payload_len = header.len() + meta.size as usize;
+    let ecc_len = ecc_len_for(payload_len);
 
-    // Frame-index width: 16-bit until the data needs more than 65,536 frames.
-    let total_bits = ecc_data.len() * 8;
-    let (_, data_bits_default) = frame_layout(DEFAULT_FRAME_INDEX_BITS);
-    let frames_16 = frames_needed(total_bits, data_bits_default);
-    let (index_bits, data_bits_per_frame) = if frames_16 as u64 <= MAX_FRAME_COUNT_DEFAULT {
-        (DEFAULT_FRAME_INDEX_BITS, data_bits_default)
-    } else {
-        let (_, dbpf) = frame_layout(EXTENDED_FRAME_INDEX_BITS);
-        let num = frames_needed(total_bits, dbpf);
-        if num as u64 > MAX_FRAME_COUNT_EXTENDED {
-            bail!("payload needs {num} frames, exceeding 32-bit frame index capacity");
-        }
-        (EXTENDED_FRAME_INDEX_BITS, dbpf)
-    };
-
-    // Unpack ECC bytes to bits (MSB first) and pad to a whole number of frames.
-    let mut all_bits: Vec<u8> = Vec::with_capacity(ecc_data.len() * 8);
-    for &b in &ecc_data {
-        for k in (0..8).rev() {
-            all_bits.push((b >> k) & 1);
-        }
+    let index_bits = select_index_bits(ecc_len);
+    let (_, data_bits_per_frame) = frame_layout(index_bits);
+    let data_bytes_per_frame = data_bits_per_frame / 8;
+    let num_data_frames = ecc_len.div_ceil(data_bytes_per_frame);
+    if num_data_frames as u64 > MAX_FRAME_COUNT_EXTENDED {
+        bail!("payload needs {num_data_frames} frames, exceeding 32-bit frame index capacity");
     }
-    let rem = all_bits.len() % data_bits_per_frame;
-    if rem != 0 {
-        all_bits.resize(all_bits.len() + (data_bits_per_frame - rem), 0);
-    }
-    let num_data_frames = all_bits.len() / data_bits_per_frame;
     let total_frames = num_data_frames + METADATA_FRAMES;
     let duration_sec = total_frames as f64 / FRAME_RATE as f64;
 
-    let audio_byte_count = ecc_data
-        .len()
-        .min((duration_sec * BYTES_PER_SEC_AUDIO as f64) as usize);
-    let audio_payload = select_audio_bytes(&ecc_data, audio_byte_count, Some(AUDIO_LAYOUT));
-    let qr_payload = build_qr_metadata(
-        &meta,
-        ecc_data.len(),
-        num_data_frames as u64,
-        index_bits,
-        audio_byte_count,
-        AUDIO_LAYOUT,
-    );
-    let qr_luma = make_qr_luma(&qr_payload)?;
-    let pcm = make_audio_pcm(&audio_payload, duration_sec);
-
-    let coverage = if ecc_data.is_empty() {
-        0.0
-    } else {
-        audio_byte_count as f64 / ecc_data.len() as f64 * 100.0
-    };
-    println!("\n[3/5] Plan");
+    println!("\n[2/4] Plan");
+    println!("      ECC stream:     {ecc_len} bytes");
     println!("      Data frames:    {num_data_frames}");
     println!("      Total frames:   {total_frames} @ {FRAME_RATE}fps ({duration_sec:.1}s)");
     println!("      Frame index:    {index_bits} bits");
-    println!("      Audio layout:   {AUDIO_LAYOUT}");
-    println!(
-        "      Audio covers:   {audio_byte_count}/{} bytes ({coverage:.1}%)",
-        ecc_data.len()
-    );
 
-    println!("\n[4/5] Generating frames + audio, muxing via libav...");
+    let qr_payload = build_qr_metadata(&meta, ecc_len, num_data_frames as u64, index_bits);
+    let qr_luma = make_qr_luma(&qr_payload)?;
+
     let report = EncodeReport {
         filename: meta.filename.clone(),
         size: meta.size,
         sha256: meta.sha256.clone(),
-        ecc_len: ecc_data.len(),
+        ecc_len,
         index_bits,
         num_data_frames,
         total_frames,
         duration_sec,
-        audio_byte_count,
-        audio_layout: AUDIO_LAYOUT.to_string(),
     };
 
-    let bits = all_bits;
-    let qrf = qr_luma;
-    let frame_source = move |idx: usize| -> Vec<u8> {
+    // ---- [3/4] pass 2: stream RS-encode + render frames, muxing via libav ----
+    println!("\n[3/4] Generating frames, muxing via libav...");
+    let payload_reader = Cursor::new(header).chain(BufReader::new(File::open(input_path)?));
+    let mut producer =
+        DataFrameProducer::new(StreamingEcc::new(payload_reader), data_bytes_per_frame, index_bits);
+    let make_luma = move |idx: usize| -> Result<Vec<u8>> {
         if idx < METADATA_FRAMES {
-            qrf.clone()
+            Ok(qr_luma.clone())
         } else {
-            let i = idx - METADATA_FRAMES;
-            make_frame_luma(
-                i as u64,
-                &bits[i * data_bits_per_frame..(i + 1) * data_bits_per_frame],
-                index_bits,
-            )
+            producer.next_frame()
         }
     };
-    media::encode_to_file(output_path, total_frames, frame_source, &pcm)?;
+    media::encode_to_file(output_path, total_frames, make_luma)?;
 
-    println!("\n[5/5] Done. Output: {}", output_path.display());
+    println!("\n[4/4] Done. Output: {}", output_path.display());
     Ok(report)
 }

@@ -1,19 +1,16 @@
 //! libav (ffmpeg-next) media pipeline — no subprocess.
 //!
-//! - [`encode_to_file`] muxes generated rgb24 frames (H.264, lossless CRF 0) and
-//!   mono PCM (AAC 320k) into an MP4, interleaving packets in time order.
+//! - [`encode_to_file`] muxes generated luma planes (H.264, lossless CRF 0) into a
+//!   video-only MP4.
 //! - [`decode_video_frames`] streams decoded frames back as tightly-packed rgb24.
-//! - [`decode_audio_samples`] returns the mono 44.1 kHz track as normalized f32.
-//! - [`remux_drop_audio`] copies just the video stream (used by tests).
 
 use std::path::Path;
 
 use anyhow::{anyhow, Result};
 use ffmpeg_next as ffmpeg;
-use ffmpeg::format::sample::{Sample, Type as SampleType};
 use ffmpeg::format::Pixel;
 use ffmpeg::software::scaling::{context::Context as Scaler, flag::Flags as ScaleFlags};
-use ffmpeg::{channel_layout::ChannelLayout, codec, encoder, format, frame, media, Dictionary, Packet, Rational};
+use ffmpeg::{codec, encoder, format, frame, media, Dictionary, Packet, Rational};
 
 use crate::constants::*;
 
@@ -21,10 +18,6 @@ const RGB_STRIDE: usize = FRAME_WIDTH * 3;
 
 fn video_enc_tb() -> Rational {
     Rational(1, FRAME_RATE as i32)
-}
-
-fn audio_enc_tb() -> Rational {
-    Rational(1, SAMPLE_RATE as i32)
 }
 
 /// Initialize libav once and quiet its per-frame logging (errors still show).
@@ -43,18 +36,16 @@ fn context_with_codec(c: ffmpeg::Codec) -> codec::context::Context {
     }
 }
 
-/// Encode `num_video_frames` luma planes (1920x1080 Y bytes, produced on demand
-/// by `make_luma`) and `audio_pcm` (mono, 16-bit, 44.1 kHz) into an MP4 at
-/// `output`. Frames are fed to the encoder as YUV420P directly with neutral
-/// chroma, so there is no RGB->YUV swscale pass.
-pub fn encode_to_file<F>(
-    output: &Path,
-    num_video_frames: usize,
-    make_luma: F,
-    audio_pcm: &[i16],
-) -> Result<()>
+/// Encode `num_video_frames` luma planes (1920x1080 Y bytes, produced on demand by
+/// `make_luma`) into a video-only MP4 at `output`. Frames are fed to the encoder as
+/// YUV420P directly with neutral chroma, so there is no RGB->YUV swscale pass.
+///
+/// `make_luma` is pulled with strictly increasing indices `0..num_video_frames`, so it
+/// can drive a streaming generator; returning `Result` lets a mid-stream IO error from
+/// that generator propagate out of the muxing loop.
+pub fn encode_to_file<F>(output: &Path, num_video_frames: usize, mut make_luma: F) -> Result<()>
 where
-    F: Fn(usize) -> Vec<u8>,
+    F: FnMut(usize) -> Result<Vec<u8>>,
 {
     ff_init()?;
     let mut octx = format::output(&output)?;
@@ -83,105 +74,37 @@ where
         (enc, idx)
     };
 
-    // ---- audio stream + AAC encoder ----
-    let (mut aenc, audio_idx, audio_frame_size) = {
-        let acodec = encoder::find(codec::Id::AAC)
-            .ok_or_else(|| anyhow!("AAC encoder not available"))?;
-        let mut ost = octx.add_stream(acodec)?;
-        let idx = ost.index();
-        let mut enc = context_with_codec(acodec).encoder().audio()?;
-        enc.set_rate(SAMPLE_RATE as i32);
-        enc.set_channel_layout(ChannelLayout::MONO);
-        enc.set_channels(1);
-        enc.set_format(Sample::F32(SampleType::Planar)); // FLTP
-        enc.set_bit_rate(320_000);
-        enc.set_time_base(audio_enc_tb());
-        if global_header {
-            enc.set_flags(codec::Flags::GLOBAL_HEADER);
-        }
-        let enc = enc.open_as(acodec)?;
-        ost.set_parameters(&enc);
-        let fs = (enc.frame_size() as usize).max(1);
-        (enc, idx, fs)
-    };
-
     octx.write_header()?;
     let video_tb = octx.stream(video_idx).unwrap().time_base();
-    let audio_tb = octx.stream(audio_idx).unwrap().time_base();
 
-    let num_audio_frames = if audio_pcm.is_empty() {
-        0
-    } else {
-        audio_pcm.len().div_ceil(audio_frame_size)
-    };
-
-    // Interleave video and audio in presentation-time order so the muxer's
-    // interleaving queue stays small.
-    let mut vi = 0usize;
-    let mut ai = 0usize;
-    loop {
-        let v_time = if vi < num_video_frames {
-            vi as f64 / FRAME_RATE as f64
-        } else {
-            f64::INFINITY
-        };
-        let a_time = if ai < num_audio_frames {
-            (ai * audio_frame_size) as f64 / SAMPLE_RATE as f64
-        } else {
-            f64::INFINITY
-        };
-        if v_time.is_infinite() && a_time.is_infinite() {
-            break;
+    for vi in 0..num_video_frames {
+        let luma = make_luma(vi)?;
+        let mut yuv = frame::Video::new(Pixel::YUV420P, FRAME_WIDTH as u32, FRAME_HEIGHT as u32);
+        // Y plane from the generated luma (stride-aware).
+        let ys = yuv.stride(0);
+        {
+            let yd = yuv.data_mut(0);
+            for row in 0..FRAME_HEIGHT {
+                yd[row * ys..row * ys + FRAME_WIDTH]
+                    .copy_from_slice(&luma[row * FRAME_WIDTH..(row + 1) * FRAME_WIDTH]);
+            }
         }
-
-        if v_time <= a_time {
-            let luma = make_luma(vi);
-            let mut yuv = frame::Video::new(Pixel::YUV420P, FRAME_WIDTH as u32, FRAME_HEIGHT as u32);
-            // Y plane from the generated luma (stride-aware).
-            let ys = yuv.stride(0);
-            {
-                let yd = yuv.data_mut(0);
-                for row in 0..FRAME_HEIGHT {
-                    yd[row * ys..row * ys + FRAME_WIDTH]
-                        .copy_from_slice(&luma[row * FRAME_WIDTH..(row + 1) * FRAME_WIDTH]);
-                }
+        // Neutral chroma (gray) on the half-resolution U/V planes.
+        let (cw, ch) = (FRAME_WIDTH / 2, FRAME_HEIGHT / 2);
+        for plane in 1..=2 {
+            let cs = yuv.stride(plane);
+            let cd = yuv.data_mut(plane);
+            for row in 0..ch {
+                cd[row * cs..row * cs + cw].fill(128);
             }
-            // Neutral chroma (gray) on the half-resolution U/V planes.
-            let (cw, ch) = (FRAME_WIDTH / 2, FRAME_HEIGHT / 2);
-            for plane in 1..=2 {
-                let cs = yuv.stride(plane);
-                let cd = yuv.data_mut(plane);
-                for row in 0..ch {
-                    cd[row * cs..row * cs + cw].fill(128);
-                }
-            }
-            yuv.set_pts(Some(vi as i64));
-            venc.send_frame(&yuv)?;
-            drain_video(&mut venc, &mut octx, video_idx, video_tb)?;
-            vi += 1;
-        } else {
-            let start = ai * audio_frame_size;
-            let end = (start + audio_frame_size).min(audio_pcm.len());
-            let chunk = &audio_pcm[start..end];
-            let mut af = frame::Audio::new(Sample::F32(SampleType::Planar), chunk.len(), ChannelLayout::MONO);
-            af.set_rate(SAMPLE_RATE as u32);
-            af.set_pts(Some(start as i64));
-            {
-                let plane = af.plane_mut::<f32>(0);
-                for (i, &s) in chunk.iter().enumerate() {
-                    plane[i] = s as f32 / 32768.0;
-                }
-            }
-            aenc.send_frame(&af)?;
-            drain_audio(&mut aenc, &mut octx, audio_idx, audio_tb)?;
-            ai += 1;
         }
+        yuv.set_pts(Some(vi as i64));
+        venc.send_frame(&yuv)?;
+        drain_video(&mut venc, &mut octx, video_idx, video_tb)?;
     }
 
     venc.send_eof()?;
     drain_video(&mut venc, &mut octx, video_idx, video_tb)?;
-    aenc.send_eof()?;
-    drain_audio(&mut aenc, &mut octx, audio_idx, audio_tb)?;
 
     octx.write_trailer()?;
     Ok(())
@@ -197,21 +120,6 @@ fn drain_video(
     while enc.receive_packet(&mut pkt).is_ok() {
         pkt.set_stream(stream_idx);
         pkt.rescale_ts(video_enc_tb(), stream_tb);
-        pkt.write_interleaved(octx)?;
-    }
-    Ok(())
-}
-
-fn drain_audio(
-    enc: &mut encoder::audio::Encoder,
-    octx: &mut format::context::Output,
-    stream_idx: usize,
-    stream_tb: Rational,
-) -> Result<()> {
-    let mut pkt = Packet::empty();
-    while enc.receive_packet(&mut pkt).is_ok() {
-        pkt.set_stream(stream_idx);
-        pkt.rescale_ts(audio_enc_tb(), stream_tb);
         pkt.write_interleaved(octx)?;
     }
     Ok(())
@@ -283,82 +191,3 @@ where
     Ok(())
 }
 
-/// Decode the audio stream of `input` to normalized mono f32 samples (44.1 kHz).
-/// Returns an empty vector when the file has no audio stream.
-pub fn decode_audio_samples(input: &Path) -> Result<Vec<f32>> {
-    ff_init()?;
-    let mut ictx = format::input(&input)?;
-    let audio_idx = match ictx.streams().best(media::Type::Audio) {
-        Some(s) => s.index(),
-        None => return Ok(Vec::new()),
-    };
-    let mut decoder = codec::context::Context::from_parameters(
-        ictx.stream(audio_idx).unwrap().parameters(),
-    )?
-    .decoder()
-    .audio()?;
-
-    let mut out: Vec<f32> = Vec::new();
-    for (s, packet) in ictx.packets() {
-        if s.index() == audio_idx {
-            decoder.send_packet(&packet)?;
-            drain_decoded_audio(&mut decoder, &mut out)?;
-        }
-    }
-    decoder.send_eof()?;
-    drain_decoded_audio(&mut decoder, &mut out)?;
-    Ok(out)
-}
-
-fn drain_decoded_audio(decoder: &mut ffmpeg::decoder::Audio, out: &mut Vec<f32>) -> Result<()> {
-    let mut decoded = frame::Audio::empty();
-    while decoder.receive_frame(&mut decoded).is_ok() {
-        let n = decoded.samples();
-        match decoded.format() {
-            Sample::F32(_) => out.extend_from_slice(&decoded.plane::<f32>(0)[..n]),
-            Sample::I16(_) => {
-                out.extend(decoded.plane::<i16>(0)[..n].iter().map(|&s| s as f32 / 32768.0));
-            }
-            other => anyhow::bail!("unexpected audio sample format: {other:?}"),
-        }
-    }
-    Ok(())
-}
-
-/// Copy only the video stream of `src` into `dst` (drops audio). Used by tests
-/// to verify the decoder works with no audio track.
-pub fn remux_drop_audio(src: &Path, dst: &Path) -> Result<()> {
-    ff_init()?;
-    let mut ictx = format::input(&src)?;
-    let mut octx = format::output(&dst)?;
-
-    let video_idx = ictx
-        .streams()
-        .best(media::Type::Video)
-        .ok_or_else(|| anyhow!("no video stream found"))?
-        .index();
-
-    let in_tb = {
-        let ist = ictx.stream(video_idx).unwrap();
-        let mut ost = octx.add_stream(encoder::find(codec::Id::None))?;
-        ost.set_parameters(ist.parameters());
-        unsafe {
-            (*ost.parameters().as_mut_ptr()).codec_tag = 0;
-        }
-        ist.time_base()
-    };
-
-    octx.write_header()?;
-    let out_tb = octx.stream(0).unwrap().time_base();
-
-    for (s, mut packet) in ictx.packets() {
-        if s.index() == video_idx {
-            packet.rescale_ts(in_tb, out_tb);
-            packet.set_position(-1);
-            packet.set_stream(0);
-            packet.write_interleaved(&mut octx)?;
-        }
-    }
-    octx.write_trailer()?;
-    Ok(())
-}

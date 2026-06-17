@@ -2,7 +2,7 @@
 name = "framevault"
 version = "0.1.0"
 edition = "2021"
-description = "Encode arbitrary files into YouTube-survivable video (dual video + audio FSK channels with Reed-Solomon ECC)"
+description = "Encode arbitrary files into YouTube-survivable video (video block channel with Reed-Solomon ECC)"
 readme = "README.md"
 license = "MIT"
 
@@ -14,8 +14,6 @@ reed-solomon = "0.2"
 qrcode = "0.14"
 # Pure-Rust QR detection/decode (replaces cv2 + pyzbar).
 rqrr = "0.9"
-# Windowed real FFT for 4-FSK audio demodulation.
-realfft = "3"
 # Data-parallelism for RS blocks and frame generation/analysis.
 rayon = "1"
 # Metadata (de)serialization.

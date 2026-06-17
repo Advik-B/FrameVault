@@ -46,17 +46,28 @@ pub fn bits_to_index(bits: &[u8]) -> u64 {
     bits.iter().fold(0u64, |acc, &b| (acc << 1) | (b as u64 & 1))
 }
 
+/// Expand packed `src` bytes (MSB first) into one-bit-per-element, filling `dst`.
+/// `dst.len()` must equal `src.len() * 8`.
+fn unpack_bits_into(dst: &mut [u8], src: &[u8]) {
+    debug_assert_eq!(dst.len(), src.len() * 8);
+    for (j, &byte) in src.iter().enumerate() {
+        for k in 0..8 {
+            dst[j * 8 + k] = (byte >> (7 - k)) & 1;
+        }
+    }
+}
+
 /// Render a data frame as a 1920x1080 rgb24 byte buffer: an 8-bit sync pattern,
-/// the frame index, and `data_bits` laid out over a 30x16 grid of 64x64
-/// black/white blocks. The bottom 56 px (1080 - 16*64) stay black.
-pub fn make_frame(frame_idx: u64, data_bits: &[u8], index_bits: usize) -> Vec<u8> {
+/// the frame index, and `data_bytes` (packed, MSB first) laid out over a 30x16 grid
+/// of 64x64 black/white blocks. The bottom 56 px (1080 - 16*64) stay black.
+pub fn make_frame(frame_idx: u64, data_bytes: &[u8], index_bits: usize) -> Vec<u8> {
     let header_bits = SYNC_BITS + index_bits;
-    debug_assert_eq!(data_bits.len(), TOTAL_BLOCKS - header_bits);
+    debug_assert_eq!(data_bytes.len() * 8, TOTAL_BLOCKS - header_bits);
 
     let mut block_bits = [0u8; TOTAL_BLOCKS];
     block_bits[..SYNC_BITS].copy_from_slice(&SYNC_PATTERN);
     block_bits[SYNC_BITS..header_bits].copy_from_slice(&index_to_bits(frame_idx, index_bits));
-    block_bits[header_bits..].copy_from_slice(data_bits);
+    unpack_bits_into(&mut block_bits[header_bits..], data_bytes);
 
     let mut frame = vec![0u8; FRAME_WIDTH * FRAME_HEIGHT * 3];
     for r in 0..ROWS {
@@ -80,17 +91,17 @@ pub fn make_frame(frame_idx: u64, data_bits: &[u8], index_bits: usize) -> Vec<u8
 pub const BLACK_Y: u8 = 16;
 pub const WHITE_Y: u8 = 235;
 
-/// Render a data frame's 1920x1080 luma plane directly (single channel). Bottom
-/// padding rows stay black. Equivalent to [`make_frame`]'s R channel but ~3x
-/// less data and no swscale needed on encode.
-pub fn make_frame_luma(frame_idx: u64, data_bits: &[u8], index_bits: usize) -> Vec<u8> {
+/// Render a data frame's 1920x1080 luma plane directly (single channel) from
+/// `data_bytes` (packed, MSB first). Bottom padding rows stay black. Equivalent to
+/// [`make_frame`]'s R channel but ~3x less data and no swscale needed on encode.
+pub fn make_frame_luma(frame_idx: u64, data_bytes: &[u8], index_bits: usize) -> Vec<u8> {
     let header_bits = SYNC_BITS + index_bits;
-    debug_assert_eq!(data_bits.len(), TOTAL_BLOCKS - header_bits);
+    debug_assert_eq!(data_bytes.len() * 8, TOTAL_BLOCKS - header_bits);
 
     let mut block_bits = [0u8; TOTAL_BLOCKS];
     block_bits[..SYNC_BITS].copy_from_slice(&SYNC_PATTERN);
     block_bits[SYNC_BITS..header_bits].copy_from_slice(&index_to_bits(frame_idx, index_bits));
-    block_bits[header_bits..].copy_from_slice(data_bits);
+    unpack_bits_into(&mut block_bits[header_bits..], data_bytes);
 
     let mut luma = vec![BLACK_Y; FRAME_WIDTH * FRAME_HEIGHT];
     for r in 0..ROWS {
@@ -131,21 +142,22 @@ pub fn read_blocks(frame: &[u8]) -> [u8; TOTAL_BLOCKS] {
     bits
 }
 
-/// Validate the sync pattern and split a 480-bit frame into `(index, data_bits)`.
-/// Returns `None` if the leading sync pattern does not match.
+/// Validate the sync pattern and split a 480-bit frame into `(index, data_bytes)`,
+/// with the byte-aligned data region packed MSB first. Returns `None` if the leading
+/// sync pattern does not match.
 pub fn decode_frame(bits: &[u8], _index_bits: usize, header_bits: usize) -> Option<(u64, Vec<u8>)> {
     if bits[..SYNC_BITS] != SYNC_PATTERN[..] {
         return None;
     }
     let frame_idx = bits_to_index(&bits[SYNC_BITS..header_bits]);
-    Some((frame_idx, bits[header_bits..].to_vec()))
+    Some((frame_idx, pack_bits(&bits[header_bits..])))
 }
 
 /// Pack a bit array (MSB first) into bytes, dropping any trailing partial byte.
-pub fn bits_to_bytes(bits: &[u8]) -> Vec<u8> {
+fn pack_bits(bits: &[u8]) -> Vec<u8> {
     let n_bytes = bits.len() / 8;
     (0..n_bytes)
-        .map(|b| (0..8).fold(0u8, |acc, k| (acc << 1) | bits[b * 8 + k]))
+        .map(|b| (0..8).fold(0u8, |acc, k| (acc << 1) | (bits[b * 8 + k] & 1)))
         .collect()
 }
 
@@ -174,7 +186,7 @@ mod tests {
     fn frame_render_read_round_trip() {
         for &index_bits in &[16usize, 32] {
             let (header_bits, data_bits_per_frame) = frame_layout(index_bits);
-            let data: Vec<u8> = (0..data_bits_per_frame).map(|i| ((i * 7 + 3) % 2) as u8).collect();
+            let data: Vec<u8> = (0..data_bits_per_frame / 8).map(|i| (i * 7 + 3) as u8).collect();
             for &idx in &[0u64, 1, 1234, 65535] {
                 let frame = make_frame(idx, &data, index_bits);
                 assert_eq!(frame.len(), FRAME_WIDTH * FRAME_HEIGHT * 3);
