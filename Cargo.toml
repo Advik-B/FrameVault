@@ -1,0 +1,53 @@
+[package]
+name = "framevault"
+version = "0.1.0"
+edition = "2021"
+description = "Encode arbitrary files into YouTube-survivable video (video block channel with Reed-Solomon ECC)"
+readme = "README.md"
+license = "MIT"
+
+[dependencies]
+# Reed-Solomon over GF(2^8) with erasure support (per-block model, matches the
+# original reedsolo usage). Validated against variable-length blocks + 32 erasures.
+reed-solomon = "0.2"
+# QR metadata frame generation.
+qrcode = "0.14"
+# Pure-Rust QR detection/decode (replaces cv2 + pyzbar).
+rqrr = "0.9"
+# Data-parallelism for RS blocks and frame generation/analysis.
+rayon = "1"
+# Metadata (de)serialization.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# SHA-256 payload integrity.
+sha2 = "0.10"
+# CLI.
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+# System RAM detection, for the default memory budget (n% of total RAM).
+sysinfo = "0.32"
+# Atomic-rename output files (decode streams straight to a temp file, then persists it).
+tempfile = "3"
+
+# libav bindings (no subprocess). Pinned to the 6.1 line to match FFmpeg 6.1.x.
+ffmpeg-next = "6.1"
+
+# On Windows, statically link FFmpeg (+ libx264) into the binary so no FFmpeg DLLs
+# are shipped. The dev libraries come from vcpkg (x64-windows-static-md); see
+# scripts/setup-windows.ps1 and .cargo/config.toml. Cargo unions this feature with
+# the base dependency above, so non-Windows targets keep dynamic linking.
+[target.'cfg(windows)'.dependencies]
+ffmpeg-next = { version = "6.1", features = ["static"] }
+
+[profile.release]
+opt-level = 3       # optimize for speed (not size)
+lto = true
+codegen-units = 1
+
+# Optimize the codec's hot pixel loops even in dev/test builds so the libav
+# round-trip integration tests run at a reasonable speed.
+[profile.dev.package.framevault]
+opt-level = 3
+
+[profile.test.package.framevault]
+opt-level = 3
