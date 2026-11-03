@@ -1,6 +1,6 @@
 [package]
 name = "framevault-wasm"
-version = "0.1.0"
+version = "2.1.0"
 edition = "2021"
 description = "FrameVault's codec core for the browser: pair it with ffmpeg.wasm for the MP4 side"
 license = "MIT"

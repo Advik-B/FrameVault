@@ -1,7 +1,7 @@
 {
   "name": "framevault-web",
   "private": true,
-  "version": "0.1.0",
+  "version": "2.1.0",
   "description": "FrameVault in the browser: the Rust codec as WebAssembly, with ffmpeg.wasm for the video",
   "license": "MIT",
   "type": "module",

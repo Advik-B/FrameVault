@@ -1,6 +1,6 @@
 [package]
 name = "framevault"
-version = "0.1.0"
+version = "2.1.0"
 edition = "2021"
 description = "Encode arbitrary files into YouTube-survivable video (video block channel with Reed-Solomon ECC)"
 readme = "README.md"
