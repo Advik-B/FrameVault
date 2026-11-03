@@ -1,0 +1,10 @@
+# Keep GitHub's language stats about the Rust codec. The browser demo under web/ (its
+# JS/JSX/CSS/HTML, plus the vendored Purrimer bundle and coi-serviceworker) still builds
+# and deploys as usual; it just isn't counted.
+web/** linguist-detectable=false
+
+# Third-party files copied in as-is: vendored, and collapsed in pull request diffs.
+web/src/purrimer/** linguist-vendored
+web/src/purrimer/bundle.* linguist-generated
+web/public/coi-serviceworker.js linguist-vendored linguist-generated
+web/package-lock.json linguist-generated

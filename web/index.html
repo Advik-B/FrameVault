@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>FrameVault</title>
+    <meta
+      name="description"
+      content="Turn any file into a video that survives YouTube, then turn it back, entirely in your browser."
+    />
+    <!-- Adds the cross-origin isolation headers ffmpeg.wasm's threads need on static
+         hosts that can't set them (GitHub Pages). A no-op when already isolated. -->
+    <script src="./coi-serviceworker.js"></script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <noscript>FrameVault needs JavaScript and WebAssembly.</noscript>
+    <script type="module" src="./src/main.jsx"></script>
+  </body>
+</html>

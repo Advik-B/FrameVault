@@ -118,6 +118,18 @@ pub fn make_frame_luma(frame_idx: u64, data_bytes: &[u8], index_bits: usize) -> 
     luma
 }
 
+/// Bytes in one 1920x1080 yuv420p frame: a full-size Y plane plus quarter-size U and V.
+pub const YUV420P_FRAME_BYTES: usize = FRAME_WIDTH * FRAME_HEIGHT * 3 / 2;
+
+/// Append `luma` to `out` as one tightly-packed yuv420p frame with neutral (128) chroma —
+/// byte-for-byte what the native encoder hands libx264, for callers (the wasm build)
+/// that feed raw frames to an external ffmpeg instead.
+pub fn append_yuv420p(luma: &[u8], out: &mut Vec<u8>) {
+    debug_assert_eq!(luma.len(), FRAME_WIDTH * FRAME_HEIGHT);
+    out.extend_from_slice(luma);
+    out.resize(out.len() + FRAME_WIDTH * FRAME_HEIGHT / 2, 128);
+}
+
 /// Sample the clean center (`BLOCK_SAMPLE_MARGIN` inset) of each 64x64 block's
 /// R channel and threshold to a flat 480-element bit array.
 pub fn read_blocks(frame: &[u8]) -> [u8; TOTAL_BLOCKS] {

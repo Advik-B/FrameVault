@@ -3,6 +3,7 @@
 
 use framevault::decode::{decode, DecodeReport, Strategy};
 use framevault::encode::{encode, EncodeReport};
+use framevault::media::{encoder_available, Preset, VideoCodec};
 
 /// Deterministic pseudo-random bytes (xorshift64).
 fn pseudo_random(n: usize, seed: u64) -> Vec<u8> {
@@ -17,10 +18,12 @@ fn pseudo_random(n: usize, seed: u64) -> Vec<u8> {
         .collect()
 }
 
-fn round_trip_with_memory(
+fn round_trip_with(
     data: &[u8],
     filename: &str,
     memory: Option<&str>,
+    codec: VideoCodec,
+    preset: Preset,
 ) -> (Vec<u8>, EncodeReport, DecodeReport) {
     let tmp = tempfile::tempdir().unwrap();
     let infile = tmp.path().join(filename);
@@ -29,7 +32,7 @@ fn round_trip_with_memory(
     std::fs::create_dir_all(&recdir).unwrap();
     std::fs::write(&infile, data).unwrap();
 
-    let enc = encode(&infile, &video, memory).expect("encode");
+    let enc = encode(&infile, &video, memory, codec, preset).expect("encode");
     assert!(video.exists(), "encoder produced no MP4");
     let dec = decode(&video, &recdir, memory).expect("decode");
     let recovered = std::fs::read(recdir.join(filename)).expect("recovered file missing");
@@ -37,7 +40,7 @@ fn round_trip_with_memory(
 }
 
 fn round_trip(data: &[u8], filename: &str) -> (Vec<u8>, EncodeReport, DecodeReport) {
-    round_trip_with_memory(data, filename, None)
+    round_trip_with(data, filename, None, VideoCodec::H264, Preset::default())
 }
 
 fn assert_round_trip(data: &[u8], filename: &str) {
@@ -127,8 +130,52 @@ fn variety_mixed_binary() {
 #[test]
 fn tiny_memory_budget_round_trip() {
     let data = pseudo_random(20 * 1024, 9);
-    let (recovered, enc, dec) = round_trip_with_memory(&data, "tiny_budget.bin", Some("1K"));
+    let (recovered, enc, dec) =
+        round_trip_with(&data, "tiny_budget.bin", Some("1K"), VideoCodec::H264, Preset::Fast);
     assert_eq!(recovered, data, "byte-level mismatch under a tiny memory budget");
     assert!(dec.sha_ok, "SHA mismatch under a tiny memory budget");
     assert_eq!(enc.index_bits, 16);
+}
+
+// ---- codecs ----
+
+// H.265 round trip through libx265's lossless mode. Skipped (with a note) when the linked
+// FFmpeg lacks libx265 — e.g. a Windows vcpkg build from before `x265` was added to
+// scripts/setup-windows.ps1 (rerun it to rebuild).
+#[test]
+fn h265_round_trip() {
+    if !encoder_available(VideoCodec::H265) {
+        eprintln!("skipping h265_round_trip: libx265 not available in this FFmpeg build");
+        return;
+    }
+    let data = pseudo_random(4 * 1024, 11);
+    for preset in [Preset::Ultrafast, Preset::Fast, Preset::Medium] {
+        let (recovered, _enc, dec) =
+            round_trip_with(&data, "hevc.bin", None, VideoCodec::H265, preset);
+        assert_eq!(recovered, data, "byte-level mismatch through H.265 at {preset}");
+        assert!(dec.sha_ok, "SHA mismatch through H.265 at {preset}");
+    }
+}
+
+// Every preset stays lossless: slower ones only shrink the file. The B-frames that
+// `fast` and slower presets enable reorder frames in the stream, which the decoder must
+// handle; `ultrafast` has none.
+#[test]
+fn h264_presets_round_trip() {
+    let data = pseudo_random(3 * 1024, 13);
+    let mut sizes = Vec::new();
+    for preset in [Preset::Ultrafast, Preset::Fast, Preset::Veryslow] {
+        let tmp = tempfile::tempdir().unwrap();
+        let infile = tmp.path().join("p.bin");
+        let video = tmp.path().join("p.mp4");
+        std::fs::write(&infile, &data).unwrap();
+        encode(&infile, &video, None, VideoCodec::H264, preset).expect("encode");
+        sizes.push(std::fs::metadata(&video).unwrap().len());
+        let recdir = tmp.path().join("rec");
+        std::fs::create_dir_all(&recdir).unwrap();
+        let dec = decode(&video, &recdir, None).expect("decode");
+        assert!(dec.sha_ok, "SHA mismatch at preset {preset}");
+        assert_eq!(std::fs::read(&dec.output_path).unwrap(), data, "mismatch at {preset}");
+    }
+    assert!(sizes[1] < sizes[0], "fast should beat ultrafast on size: {sizes:?}");
 }

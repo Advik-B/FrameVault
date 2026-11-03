@@ -1,0 +1,89 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  core:
+    name: Codec core (no FFmpeg)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --no-default-features
+
+  native:
+    name: Native (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: Linux x86_64, os: ubuntu-24.04 }
+          - { name: macOS arm64, os: macos-14 }
+          - { name: Windows x86_64, os: windows-2022 }
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 240 # the first Windows run builds FFmpeg from source
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-ffmpeg
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --release
+      - name: Test (H.264 and H.265 round trips through libav, several presets)
+        run: cargo test
+      - name: CLI smoke test
+        shell: bash
+        run: |
+          bin=target/release/framevault
+          head -c 4096 /dev/urandom > smoke.bin
+          # codec:preset pairs; the first uses the defaults (h264, fast).
+          for combo in default h264:ultrafast h264:veryslow h265:fast; do
+            args=()
+            [[ "$combo" != default ]] && args=(--codec "${combo%%:*}" --preset "${combo##*:}")
+            name="${combo/:/-}" # no colons in Windows file names
+            "$bin" encode smoke.bin "smoke-$name.mp4" "${args[@]}"
+            mkdir -p "out-$name"
+            "$bin" decode "smoke-$name.mp4" "out-$name"
+            cmp smoke.bin "out-$name/smoke.bin"
+            echo "$combo: $(wc -c < "smoke-$name.mp4") bytes"
+          done
+
+  web:
+    name: WebAssembly + browser demo
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-pack
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: Build wasm package
+        working-directory: web
+        run: npm ci && npm run build:wasm
+      - name: Build demo
+        working-directory: web
+        run: npm run build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: framevault-web
+          path: web/dist

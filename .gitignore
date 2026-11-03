@@ -4,3 +4,6 @@
 # Editor / OS
 *.swp
 .DS_Store
+
+# Browser test artifacts
+.playwright-mcp/
