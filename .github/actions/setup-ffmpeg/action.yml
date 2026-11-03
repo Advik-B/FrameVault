@@ -1,0 +1,53 @@
+name: Set up FFmpeg 6.1 for ffmpeg-next
+description: >
+  Installs FFmpeg 6.1 development libraries (with libx264 and libx265) plus libclang for
+  bindgen. Linux and macOS link FFmpeg dynamically; Windows builds it statically via
+  vcpkg using scripts/setup-windows.ps1, cached between runs.
+
+inputs:
+  vcpkg-ref:
+    description: vcpkg release tag to build the Windows libraries against
+    default: "2026.10.16"
+
+runs:
+  using: composite
+  steps:
+    # ---- Linux: Ubuntu 24.04 ships FFmpeg 6.1 (built with x264 and x265) ----
+    - if: runner.os == 'Linux'
+      shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y --no-install-recommends \
+          pkg-config clang libclang-dev \
+          libavcodec-dev libavdevice-dev libavfilter-dev libavformat-dev \
+          libavutil-dev libswresample-dev libswscale-dev
+        # Override the Windows paths in the committed .cargo/config.toml.
+        echo "LIBCLANG_PATH=$(llvm-config --libdir 2>/dev/null || dirname "$(find /usr/lib -name 'libclang.so*' | head -n1)")" >> "$GITHUB_ENV"
+
+    # ---- macOS: Homebrew's FFmpeg 6 line (keg-only) ----
+    - if: runner.os == 'macOS'
+      shell: bash
+      run: |
+        brew install ffmpeg@6 pkgconf
+        echo "PKG_CONFIG_PATH=$(brew --prefix ffmpeg@6)/lib/pkgconfig" >> "$GITHUB_ENV"
+        echo "LIBCLANG_PATH=$(xcode-select -p)/Toolchains/XcodeDefault.xctoolchain/usr/lib" >> "$GITHUB_ENV"
+
+    # ---- Windows: static FFmpeg from vcpkg, built once and cached ----
+    - if: runner.os == 'Windows'
+      shell: pwsh
+      run: |
+        $root = Join-Path (Split-Path $env:GITHUB_WORKSPACE) "vcpkg"
+        if (-not (Test-Path $root)) {
+          git clone --depth 1 --branch "${{ inputs.vcpkg-ref }}" https://github.com/microsoft/vcpkg $root
+        }
+        "FV_VCPKG_ROOT=$root" >> $env:GITHUB_ENV
+
+    - if: runner.os == 'Windows'
+      uses: actions/cache@v4
+      with:
+        path: ${{ env.FV_VCPKG_ROOT }}/installed
+        key: vcpkg-ffmpeg-${{ inputs.vcpkg-ref }}-${{ hashFiles('scripts/setup-windows.ps1', 'scripts/vcpkg-overlay/**') }}
+
+    - if: runner.os == 'Windows'
+      shell: pwsh
+      run: ./scripts/setup-windows.ps1 -VcpkgRoot "$env:FV_VCPKG_ROOT"

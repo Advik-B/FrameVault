@@ -1,0 +1,91 @@
+name: Release assets
+
+# Builds every FrameVault flavour and attaches it to the release:
+#   framevault-<os>-<arch>.{zip,tar.gz}  the CLI (Windows is a static, self-contained .exe;
+#                                        Linux/macOS link the system's FFmpeg 6.1)
+#   framevault-wasm.tar.gz               the WebAssembly codec package (wasm-pack, --target web)
+#   framevault-web.zip                   the browser demo, ready for any static host
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag to (re)build assets for
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  TAG: ${{ github.event.release.tag_name || inputs.tag }}
+
+jobs:
+  native:
+    name: CLI (${{ matrix.asset }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-24.04, asset: framevault-linux-x86_64.tar.gz }
+          - { os: macos-14, asset: framevault-macos-arm64.tar.gz }
+          - { os: windows-2022, asset: framevault-windows-x86_64.zip }
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+      - uses: ./.github/actions/setup-ffmpeg
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release
+      - name: Package
+        shell: bash
+        run: |
+          mkdir dist
+          cp README.md dist/
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            cp target/release/framevault.exe dist/
+            (cd dist && 7z a "../${{ matrix.asset }}" .)
+          else
+            cp target/release/framevault dist/
+            tar -C dist -czf "${{ matrix.asset }}" .
+          fi
+      - name: Upload
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$TAG" "${{ matrix.asset }}" --clobber
+
+  web:
+    name: WebAssembly + demo
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-pack
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: Build
+        working-directory: web
+        run: npm ci && npm run build:wasm && npm run build
+      - name: Package
+        run: |
+          tar -C web/pkg -czf framevault-wasm.tar.gz --exclude=.gitignore .
+          (cd web/dist && zip -qr ../../framevault-web.zip .)
+      - name: Upload
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$TAG" framevault-wasm.tar.gz framevault-web.zip --clobber
