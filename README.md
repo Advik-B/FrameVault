@@ -336,6 +336,12 @@ npm run build          # static site in web/dist
   each dev or build run. In dev, Vite would otherwise rewrite the core's classic pthread worker
   and break every ffmpeg thread. ffmpeg's thread counts are also capped, because "auto" can ask
   for more threads than ffmpeg.wasm's fixed pthread pool holds, which deadlocks it.
+- **Purrimer goes through the build.** `web/src/purrimer/bundle.js` is the design system's
+  exported bundle, kept byte-for-byte so updates are a drop-in copy. It's a classic script that
+  reads `window.React`, so `web/plugins/purrimer.js` compiles it at build time into ES modules
+  (`import * as P from "purrimer"`) that import React from npm. That way Rollup tree-shakes the
+  components the demo doesn't use and minifies the rest. The whole app, including React, is
+  one ~74 KB (gzipped) script.
 - **Speed.** Small files take seconds. Very large files are better done with the CLI, which is
   several times faster and isn't bound by a browser tab's memory.
 - **H.265 previews.** Not every browser can play HEVC in a `<video>` element (Firefox can't), but

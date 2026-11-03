@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import * as P from "purrimer";
 
 import {
   CODECS,
@@ -10,7 +11,6 @@ import {
   planEncode,
 } from "./pipeline.js";
 
-const P = window.Purrimer;
 
 // Purrimer's greyscale pair only: ink on paper by day, chalk on black by night.
 const THEMES = [
