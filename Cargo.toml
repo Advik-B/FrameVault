@@ -69,3 +69,8 @@ opt-level = 3
 
 [profile.test.package.framevault]
 opt-level = 3
+
+[workspace]
+members = [".", "wasm"]
+# Plain `cargo build` / `cargo test` stay native-only; the wasm crate is built with wasm-pack.
+default-members = ["."]

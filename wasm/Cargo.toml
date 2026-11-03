@@ -1,0 +1,16 @@
+[package]
+name = "framevault-wasm"
+version = "0.1.0"
+edition = "2021"
+description = "FrameVault's codec core for the browser: pair it with ffmpeg.wasm for the MP4 side"
+license = "MIT"
+repository = "https://github.com/Advik-B/FrameVault"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+framevault = { path = "..", default-features = false }
+wasm-bindgen = "0.2"
+console_error_panic_hook = "0.1"
