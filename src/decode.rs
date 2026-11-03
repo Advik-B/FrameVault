@@ -122,10 +122,21 @@ enum Sink<W: Write> {
         payload: PayloadSink<W>,
         dbpf: usize,
         frames: usize,
+        /// One bit per data frame index: counts each frame once, however many times it's
+        /// pushed (the browser decoder re-reads a few frames at each chunk seam).
+        seen_frames: Vec<u64>,
         total_ecc_len: usize,
         sha_expected: String,
         filename: String,
     },
+}
+
+/// Set bit `i`, returning whether it was previously clear.
+fn mark_seen(seen: &mut [u64], i: usize) -> bool {
+    let (word, bit) = (i / 64, 1u64 << (i % 64));
+    let fresh = seen[word] & bit == 0;
+    seen[word] |= bit;
+    fresh
 }
 
 /// Frame-level counters from a decode run.
@@ -133,7 +144,7 @@ enum Sink<W: Write> {
 pub struct DecodeStats {
     /// Frames pushed into the decoder.
     pub total: usize,
-    /// Data frames with a valid sync pattern and an in-range index.
+    /// Distinct data frames with a valid sync pattern and an in-range index.
     pub valid: usize,
     /// Frames whose sync pattern didn't match (QR frames always land here).
     pub sync_fail: usize,
@@ -229,13 +240,16 @@ impl<W: Write, F: FnMut(&str, u64) -> io::Result<W>> FrameDecoder<W, F> {
                     payload,
                     dbpf,
                     frames,
+                    seen_frames,
                     total_ecc_len,
                     ..
                 } => {
                     let i = idx as usize;
                     if i < *frames {
                         write_into_window(window, payload, *total_ecc_len, i * *dbpf, &data)?;
-                        self.valid += 1;
+                        if mark_seen(seen_frames, i) {
+                            self.valid += 1;
+                        }
                     }
                 }
                 Sink::Pending { buffered } => buffered.push((idx, data)),
@@ -279,6 +293,7 @@ impl<W: Write, F: FnMut(&str, u64) -> io::Result<W>> FrameDecoder<W, F> {
             };
             let mut window = Window::new(self.window_bytes);
             let mut payload = PayloadSink::new((self.open)(&filename, size)?, size);
+            let mut seen_frames = vec![0u64; frames.div_ceil(64)];
             if let Sink::Pending { buffered } = &self.sink {
                 for (idx, data) in buffered {
                     let i = *idx as usize;
@@ -290,7 +305,9 @@ impl<W: Write, F: FnMut(&str, u64) -> io::Result<W>> FrameDecoder<W, F> {
                             i * dbpf,
                             data,
                         )?;
-                        self.valid += 1;
+                        if mark_seen(&mut seen_frames, i) {
+                            self.valid += 1;
+                        }
                     }
                 }
             }
@@ -299,6 +316,7 @@ impl<W: Write, F: FnMut(&str, u64) -> io::Result<W>> FrameDecoder<W, F> {
                 payload,
                 dbpf,
                 frames,
+                seen_frames,
                 total_ecc_len,
                 sha_expected: sha256,
                 filename,
@@ -624,6 +642,9 @@ mod tests {
         let out = dec.finish().unwrap();
         assert!(out.sha_ok);
         assert_eq!(out.filename, "core.bin");
+        // The duplicate counts once; the dropped frame shows up as missing.
+        assert_eq!(out.stats.valid, out.stats.expected_frames - 1);
+        assert_eq!(out.stats.missing, 1);
         assert_eq!(out.writer, file);
         assert_eq!(opened, Some(("core.bin".to_string(), file.len() as u64)));
     }
