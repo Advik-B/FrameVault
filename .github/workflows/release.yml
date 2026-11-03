@@ -5,13 +5,17 @@ name: Release assets
 #                                        Linux/macOS link the system's FFmpeg 6.1)
 #   framevault-wasm.tar.gz               the WebAssembly codec package (wasm-pack, --target web)
 #   framevault-web.zip                   the browser demo, ready for any static host
+#
+# Pushing a v* tag is enough: the release is created (with generated notes) if it
+# doesn't exist yet. A release made by hand on GitHub also creates/pushes its tag,
+# so it lands here too.
 on:
-  release:
-    types: [published]
+  push:
+    tags: ['v*']
   workflow_dispatch:
     inputs:
       tag:
-        description: Existing release tag to (re)build assets for
+        description: Existing tag to (re)build release assets for
         required: true
 
 permissions:
@@ -19,11 +23,23 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  TAG: ${{ github.event.release.tag_name || inputs.tag }}
+  TAG: ${{ inputs.tag || github.ref_name }}
 
 jobs:
+  release:
+    name: Create release
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Create release if missing
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1 ||
+            gh release create "$TAG" -R "$GITHUB_REPOSITORY" --title "$TAG" --generate-notes --verify-tag
+
   native:
     name: CLI (${{ matrix.asset }})
+    needs: release
     strategy:
       fail-fast: false
       matrix:
@@ -61,6 +77,7 @@ jobs:
 
   web:
     name: WebAssembly + demo
+    needs: release
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
