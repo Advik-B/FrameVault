@@ -29,8 +29,8 @@ enum Command {
         /// system RAM.
         #[arg(long)]
         memory: Option<String>,
-        /// Video codec. H.265 makes smaller files but encodes much more slowly; decode
-        /// detects the codec on its own.
+        /// Video codec. H.265 is slower to encode and, at the fast lossless preset used,
+        /// makes larger files than H.264. Decode detects the codec on its own.
         #[arg(long, value_enum, default_value = "h264")]
         codec: VideoCodec,
     },

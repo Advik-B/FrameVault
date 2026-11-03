@@ -34,7 +34,8 @@ pub enum VideoCodec {
     /// H.264 via libx264 (CRF 0). Fast; plays everywhere.
     #[default]
     H264,
-    /// H.265/HEVC via libx265 (lossless mode). Smaller files, slower to encode.
+    /// H.265/HEVC via libx265 (lossless mode). Slower; at the `ultrafast` preset its files
+    /// come out larger than H.264's for FrameVault's block frames.
     H265,
 }
 
