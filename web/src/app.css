@@ -1,0 +1,174 @@
+/* FrameVault demo layout. Every value comes from a Purrimer token (tokens.css). */
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  background: var(--bgColor-inset);
+}
+
+.fg-muted {
+  color: var(--fgColor-muted);
+}
+
+/* App shell: max 1280px, page header on base-size-48 rhythm */
+.fv-shell {
+  box-sizing: border-box;
+  max-width: 1280px;
+  margin: 0 auto;
+  padding: var(--base-size-48, 48px) var(--stack-padding-spacious, 24px);
+  display: flex;
+  flex-direction: column;
+  gap: var(--stack-gap-spacious, 24px);
+}
+
+.fv-header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--stack-gap-normal, 16px);
+}
+
+.fv-title {
+  display: flex;
+  flex-direction: column;
+  gap: var(--stack-gap-condensed, 8px);
+  max-width: 768px;
+}
+
+.fv-header-side {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--stack-gap-condensed, 8px);
+}
+
+.fv-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 440px), 1fr));
+  gap: var(--stack-gap-spacious, 24px);
+  align-items: start;
+}
+
+.fv-panel {
+  display: flex;
+  flex-direction: column;
+  gap: var(--stack-gap-normal, 16px);
+}
+
+.fv-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--stack-gap-condensed, 8px) var(--stack-gap-normal, 16px);
+}
+
+.fv-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--stack-gap-condensed, 8px);
+}
+
+/* Drop zone: the one place dashed borders are allowed */
+.fv-drop {
+  display: flex;
+  align-items: center;
+  gap: var(--stack-gap-normal, 16px);
+  padding: var(--stack-padding-normal, 16px);
+  border: var(--borderWidth-thin, 1px) dashed var(--control-borderColor-rest);
+  border-radius: var(--borderRadius-large);
+  background: var(--bgColor-muted);
+  transition:
+    background-color var(--duration-fast, 120ms) var(--easing-standard, ease),
+    border-color var(--duration-fast, 120ms) var(--easing-standard, ease);
+}
+
+.fv-drop.is-over {
+  background: var(--bgColor-accent-muted);
+  border-color: var(--borderColor-accent-emphasis, var(--fgColor-accent));
+}
+
+.fv-drop.is-disabled {
+  opacity: 0.7;
+}
+
+.fv-drop-icon {
+  flex: none;
+  color: var(--fgColor-muted);
+}
+
+.fv-drop.is-over .fv-drop-icon {
+  color: var(--fgColor-accent);
+}
+
+.fv-drop-text {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.fv-drop-name {
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Stat tiles: JetBrains Mono figures under a muted label */
+.fv-stats {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+  gap: var(--stack-gap-condensed, 8px);
+}
+
+.fv-stat {
+  display: flex;
+  flex-direction: column;
+  gap: var(--base-size-4, 4px);
+  padding: var(--base-size-12, 12px) var(--stack-padding-normal, 16px);
+  border: var(--borderWidth-thin, 1px) solid var(--borderColor-muted);
+  border-radius: var(--borderRadius-medium);
+  background: var(--bgColor-default);
+}
+
+.fv-progress {
+  display: flex;
+  flex-direction: column;
+  gap: var(--stack-gap-condensed, 8px);
+}
+
+.fv-result {
+  display: flex;
+  flex-direction: column;
+  gap: var(--stack-gap-normal, 16px);
+}
+
+.fv-video {
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  border: var(--borderWidth-thin, 1px) solid var(--borderColor-default);
+  border-radius: var(--borderRadius-large);
+  background: var(--bgColor-emphasis);
+}
+
+.fv-hash {
+  display: flex;
+  flex-direction: column;
+  gap: var(--base-size-4, 4px);
+}
+
+.fv-hash code {
+  overflow-wrap: anywhere;
+  align-self: flex-start;
+  padding: 2px var(--base-size-4, 4px);
+  border-radius: var(--borderRadius-small);
+  background: var(--bgColor-neutral-muted);
+}
+
+.fv-footer {
+  display: flex;
+  flex-direction: column;
+  gap: var(--stack-gap-condensed, 8px);
+  max-width: 768px;
+}

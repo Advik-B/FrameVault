@@ -1,0 +1,28 @@
+{
+  "name": "framevault-web",
+  "private": true,
+  "version": "0.1.0",
+  "description": "FrameVault in the browser: the Rust codec as WebAssembly, with ffmpeg.wasm for the video",
+  "license": "MIT",
+  "type": "module",
+  "scripts": {
+    "build:wasm": "wasm-pack build ../wasm --release --target web --out-dir ../web/pkg",
+    "prepare-assets": "node scripts/gen-tokens.mjs && node scripts/copy-ffmpeg-core.mjs",
+    "predev": "npm run prepare-assets",
+    "dev": "vite",
+    "prebuild": "npm run prepare-assets",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@ffmpeg/core-mt": "0.12.10",
+    "@ffmpeg/ffmpeg": "0.12.15",
+    "@ffmpeg/util": "0.12.2",
+    "react": "18.3.1",
+    "react-dom": "18.3.1"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "6.1.2",
+    "vite": "8.3.4"
+  }
+}
