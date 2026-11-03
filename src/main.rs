@@ -4,6 +4,7 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use framevault::media::VideoCodec;
 
 #[derive(Parser)]
 #[command(
@@ -28,6 +29,10 @@ enum Command {
         /// system RAM.
         #[arg(long)]
         memory: Option<String>,
+        /// Video codec. H.265 makes smaller files but encodes much more slowly; decode
+        /// detects the codec on its own.
+        #[arg(long, value_enum, default_value = "h264")]
+        codec: VideoCodec,
     },
     /// Decode a FrameVault MP4 back into the original file.
     Decode {
@@ -46,8 +51,8 @@ enum Command {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Command::Encode { input, output, memory } => {
-            framevault::encode::encode(&input, &output, memory.as_deref())?;
+        Command::Encode { input, output, memory, codec } => {
+            framevault::encode::encode(&input, &output, memory.as_deref(), codec)?;
         }
         Command::Decode { video, output_dir, memory } => {
             std::fs::create_dir_all(&output_dir)?;

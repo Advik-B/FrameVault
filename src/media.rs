@@ -1,6 +1,6 @@
 //! libav (ffmpeg-next) media pipeline — no subprocess.
 //!
-//! - [`encode_to_file`] muxes generated luma planes (H.264, lossless CRF 0) into a
+//! - [`encode_to_file`] muxes generated luma planes (lossless H.264 or H.265) into a
 //!   video-only MP4.
 //! - [`decode_video_frames`] streams decoded frames back as tightly-packed rgb24.
 
@@ -27,6 +27,52 @@ fn ff_init() -> Result<()> {
     Ok(())
 }
 
+/// Video codec for the encoded MP4. Both are lossless locally; decode handles either
+/// (the codec comes from the stream itself).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+pub enum VideoCodec {
+    /// H.264 via libx264 (CRF 0). Fast; plays everywhere.
+    #[default]
+    H264,
+    /// H.265/HEVC via libx265 (lossless mode). Smaller files, slower to encode.
+    H265,
+}
+
+impl VideoCodec {
+    fn encoder_name(self) -> &'static str {
+        match self {
+            VideoCodec::H264 => "libx264",
+            VideoCodec::H265 => "libx265",
+        }
+    }
+
+    fn options(self) -> Dictionary<'static> {
+        let mut opts = Dictionary::new();
+        opts.set("preset", "ultrafast");
+        match self {
+            VideoCodec::H264 => opts.set("crf", "0"), // lossless H.264
+            // x265's CRF 0 is *not* lossless; its lossless mode is a separate switch.
+            VideoCodec::H265 => opts.set("x265-params", "lossless=1:log-level=error"),
+        }
+        opts
+    }
+}
+
+impl std::fmt::Display for VideoCodec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            VideoCodec::H264 => "H.264",
+            VideoCodec::H265 => "H.265",
+        })
+    }
+}
+
+/// Whether the linked FFmpeg has the encoder for `codec` (e.g. builds without libx265).
+pub fn encoder_available(codec: VideoCodec) -> bool {
+    ff_init().is_ok() && encoder::find_by_name(codec.encoder_name()).is_some()
+}
+
+
 /// Allocate a codec context bound to `codec` so it inherits that codec's own
 /// option defaults. A NULL-codec context (e.g. `Context::new`) carries ffmpeg's
 /// generic defaults, which makes libx264 reject the settings as "broken".
@@ -37,13 +83,19 @@ fn context_with_codec(c: ffmpeg::Codec) -> codec::context::Context {
 }
 
 /// Encode `num_video_frames` luma planes (1920x1080 Y bytes, produced on demand by
-/// `make_luma`) into a video-only MP4 at `output`. Frames are fed to the encoder as
-/// YUV420P directly with neutral chroma, so there is no RGB->YUV swscale pass.
+/// `make_luma`) into a video-only MP4 at `output` with `video_codec`. Frames are fed to
+/// the encoder as YUV420P directly with neutral chroma, so there is no RGB->YUV swscale
+/// pass.
 ///
 /// `make_luma` is pulled with strictly increasing indices `0..num_video_frames`, so it
 /// can drive a streaming generator; returning `Result` lets a mid-stream IO error from
 /// that generator propagate out of the muxing loop.
-pub fn encode_to_file<F>(output: &Path, num_video_frames: usize, mut make_luma: F) -> Result<()>
+pub fn encode_to_file<F>(
+    output: &Path,
+    num_video_frames: usize,
+    video_codec: VideoCodec,
+    mut make_luma: F,
+) -> Result<()>
 where
     F: FnMut(usize) -> Result<Vec<u8>>,
 {
@@ -51,10 +103,14 @@ where
     let mut octx = format::output(&output)?;
     let global_header = octx.format().flags().contains(format::Flags::GLOBAL_HEADER);
 
-    // ---- video stream + H.264 encoder ----
+    // ---- video stream + encoder ----
     let (mut venc, video_idx) = {
-        let vcodec = encoder::find(codec::Id::H264)
-            .ok_or_else(|| anyhow!("H.264 encoder (libx264) not available"))?;
+        let vcodec = encoder::find_by_name(video_codec.encoder_name()).ok_or_else(|| {
+            anyhow!(
+                "{video_codec} encoder ({}) not available in this FFmpeg build",
+                video_codec.encoder_name()
+            )
+        })?;
         let mut ost = octx.add_stream(vcodec)?;
         let idx = ost.index();
         let mut enc = context_with_codec(vcodec).encoder().video()?;
@@ -66,11 +122,15 @@ where
         if global_header {
             enc.set_flags(codec::Flags::GLOBAL_HEADER);
         }
-        let mut opts = Dictionary::new();
-        opts.set("crf", "0"); // lossless H.264 for the local source
-        opts.set("preset", "ultrafast");
-        let enc = enc.open_as_with(vcodec, opts)?;
+        let enc = enc.open_as_with(vcodec, video_codec.options())?;
         ost.set_parameters(&enc);
+        if video_codec == VideoCodec::H265 {
+            // Tag HEVC as `hvc1` (not libav's default `hev1`) so Apple players and
+            // browsers will play the MP4.
+            unsafe {
+                (*(*ost.as_mut_ptr()).codecpar).codec_tag = u32::from_le_bytes(*b"hvc1");
+            }
+        }
         (enc, idx)
     };
 

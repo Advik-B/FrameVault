@@ -5,12 +5,13 @@
 
 .DESCRIPTION
     FrameVault links FFmpeg through the `ffmpeg-next` / `ffmpeg-sys-next` crates. On Windows
-    it links FFmpeg (+ libx264) *statically* so the produced `framevault.exe` ships without
+    it links FFmpeg (+ libx264, libx265) *statically* so the produced `framevault.exe` ships without
     FFmpeg DLLs. The static, MSVC-compatible libraries are built by vcpkg using the
     `x64-windows-static-md` triplet (static libs, dynamic CRT). This script:
       1. Clones + bootstraps vcpkg (if missing).
-      2. Builds FFmpeg with the libx264 (GPL) encoder. GPL is required because the encoder
-         uses libx264 (H.264 CRF 0); without it, encoding fails at runtime. This is a slow,
+      2. Builds FFmpeg with the libx264 and libx265 (GPL) encoders. GPL is required because
+         the encoders are libx264 (H.264, default) and libx265 (H.265, `--codec h265`);
+         without them, encoding fails at runtime. This is a slow,
          one-time, from-source build (vcpkg auto-acquires nasm/cmake/ninja/msys2).
       3. Locates libclang (from an LLVM install) for bindgen.
       4. Writes .cargo\config.toml so `cargo build` routes through vcpkg's static libraries.
@@ -51,21 +52,23 @@ if (-not (Test-Path $vcpkgExe)) {
 if (-not (Test-Path $vcpkgExe)) { throw "vcpkg bootstrap failed: $vcpkgExe not found" }
 Write-Step "vcpkg ready at $VcpkgRoot"
 
-# --- 2. FFmpeg 6.1.1 (static, GPL/libx264) ----------------------------------------
+# --- 2. FFmpeg 6.1.1 (static, GPL/libx264+libx265) ----------------------------------------
 # ffmpeg-next 6.1 binds the pre-FFmpeg-7 API (src/media.rs uses AVCodecContext.channels /
 # channel_layout, removed in FFmpeg 7), but vcpkg's current ports ship FFmpeg 8.x. Rather
 # than pin vcpkg to the 2024 baseline (whose msys2 build-tool packages have been pruned
 # from the mirrors), we overlay only the FFmpeg *port* at version 6.1.1 (committed under
-# scripts/vcpkg-overlay/ffmpeg) on top of the current baseline. x264 and the msys2 build
+# scripts/vcpkg-overlay/ffmpeg) on top of the current baseline. x264, x265 and the msys2 build
 # tools come from the live current baseline; only the FFmpeg source is pinned to n6.1.1.
 $overlayPorts = Join-Path $repoRoot "scripts\vcpkg-overlay"
 $ffmpegInstalled = Test-Path (Join-Path $VcpkgRoot "installed\$Triplet\lib\avcodec.lib")
-if ($ffmpegInstalled -and -not $Force) {
+# An FFmpeg built before H.265 support lacks the x265 feature: rebuild it in that case.
+$hasX265 = [bool]((& $vcpkgExe list "ffmpeg:$Triplet") -match "^ffmpeg\[x265\]:")
+if ($ffmpegInstalled -and $hasX265 -and -not $Force) {
     Write-Step "FFmpeg already installed for $Triplet (use -Force to rebuild)"
 } else {
-    Write-Step "Building FFmpeg 6.1.1[x264] for $Triplet (slow, one-time, from source) ..."
-    & $vcpkgExe install "ffmpeg[avdevice,avfilter,avformat,swresample,swscale,x264]:$Triplet" `
-        --overlay-ports="$overlayPorts"
+    Write-Step "Building FFmpeg 6.1.1[x264,x265] for $Triplet (slow, one-time, from source) ..."
+    & $vcpkgExe install "ffmpeg[avdevice,avfilter,avformat,swresample,swscale,x264,x265]:$Triplet" `
+        --overlay-ports="$overlayPorts" --recurse
     if ($LASTEXITCODE -ne 0) { throw "vcpkg install ffmpeg failed (exit $LASTEXITCODE)" }
     if (-not (Test-Path (Join-Path $VcpkgRoot "installed\$Triplet\lib\avcodec.lib"))) {
         throw "vcpkg did not produce avcodec.lib for $Triplet"

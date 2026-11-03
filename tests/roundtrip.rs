@@ -3,6 +3,7 @@
 
 use framevault::decode::{decode, DecodeReport, Strategy};
 use framevault::encode::{encode, EncodeReport};
+use framevault::media::{encoder_available, VideoCodec};
 
 /// Deterministic pseudo-random bytes (xorshift64).
 fn pseudo_random(n: usize, seed: u64) -> Vec<u8> {
@@ -17,10 +18,11 @@ fn pseudo_random(n: usize, seed: u64) -> Vec<u8> {
         .collect()
 }
 
-fn round_trip_with_memory(
+fn round_trip_with(
     data: &[u8],
     filename: &str,
     memory: Option<&str>,
+    codec: VideoCodec,
 ) -> (Vec<u8>, EncodeReport, DecodeReport) {
     let tmp = tempfile::tempdir().unwrap();
     let infile = tmp.path().join(filename);
@@ -29,7 +31,7 @@ fn round_trip_with_memory(
     std::fs::create_dir_all(&recdir).unwrap();
     std::fs::write(&infile, data).unwrap();
 
-    let enc = encode(&infile, &video, memory).expect("encode");
+    let enc = encode(&infile, &video, memory, codec).expect("encode");
     assert!(video.exists(), "encoder produced no MP4");
     let dec = decode(&video, &recdir, memory).expect("decode");
     let recovered = std::fs::read(recdir.join(filename)).expect("recovered file missing");
@@ -37,7 +39,7 @@ fn round_trip_with_memory(
 }
 
 fn round_trip(data: &[u8], filename: &str) -> (Vec<u8>, EncodeReport, DecodeReport) {
-    round_trip_with_memory(data, filename, None)
+    round_trip_with(data, filename, None, VideoCodec::H264)
 }
 
 fn assert_round_trip(data: &[u8], filename: &str) {
@@ -127,8 +129,26 @@ fn variety_mixed_binary() {
 #[test]
 fn tiny_memory_budget_round_trip() {
     let data = pseudo_random(20 * 1024, 9);
-    let (recovered, enc, dec) = round_trip_with_memory(&data, "tiny_budget.bin", Some("1K"));
+    let (recovered, enc, dec) =
+        round_trip_with(&data, "tiny_budget.bin", Some("1K"), VideoCodec::H264);
     assert_eq!(recovered, data, "byte-level mismatch under a tiny memory budget");
     assert!(dec.sha_ok, "SHA mismatch under a tiny memory budget");
     assert_eq!(enc.index_bits, 16);
+}
+
+// ---- codecs ----
+
+// H.265 round trip through libx265's lossless mode. Skipped (with a note) when the linked
+// FFmpeg lacks libx265 — e.g. a Windows vcpkg build from before `x265` was added to
+// scripts/setup-windows.ps1 (rerun it to rebuild).
+#[test]
+fn h265_round_trip() {
+    if !encoder_available(VideoCodec::H265) {
+        eprintln!("skipping h265_round_trip: libx265 not available in this FFmpeg build");
+        return;
+    }
+    let data = pseudo_random(4 * 1024, 11);
+    let (recovered, _enc, dec) = round_trip_with(&data, "hevc.bin", None, VideoCodec::H265);
+    assert_eq!(recovered, data, "byte-level mismatch through H.265");
+    assert!(dec.sha_ok, "SHA mismatch through H.265");
 }
