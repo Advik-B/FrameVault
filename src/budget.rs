@@ -4,16 +4,17 @@
 //! batch/window is Reed-Solomon decoded independently (see `rs.rs`).
 
 use anyhow::{bail, Result};
-use sysinfo::System;
 
 use crate::constants::RS_BLOCK_SIZE;
 
 /// Fraction of total system RAM used as the default budget when `--memory` isn't given.
+#[cfg(feature = "native")]
 const DEFAULT_RAM_FRACTION: f64 = 0.25;
 
 /// Floor applied only to the RAM-derived default, guarding against pathologically
 /// small results (e.g. RAM detection failing or returning near-zero). An explicit
 /// `--memory` value is never clamped against this — see [`blocks_for_budget`].
+#[cfg(feature = "native")]
 const MIN_DEFAULT_BUDGET_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Parse a human-supplied size string ("512M", "2G", "1024K", or a bare byte count,
@@ -42,11 +43,12 @@ pub fn parse_size(s: &str) -> Result<u64> {
 /// Resolve the effective memory budget in bytes: the explicit value if given (parsed
 /// as-is, no floor), else `DEFAULT_RAM_FRACTION` of total system RAM, floored at
 /// `MIN_DEFAULT_BUDGET_BYTES`.
+#[cfg(feature = "native")]
 pub fn resolve_budget_bytes(explicit: Option<&str>) -> Result<u64> {
     match explicit {
         Some(s) => parse_size(s),
         None => {
-            let mut sys = System::new();
+            let mut sys = sysinfo::System::new();
             sys.refresh_memory();
             let total = sys.total_memory(); // bytes (sysinfo 0.3x)
             let derived = (total as f64 * DEFAULT_RAM_FRACTION) as u64;
@@ -95,6 +97,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "native")]
     fn explicit_budget_not_floored() {
         // An explicit tiny budget is respected (down to blocks_for_budget's own
         // minimum-1 guarantee), unlike the RAM-derived default.
@@ -104,6 +107,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "native")]
     fn default_budget_has_a_floor() {
         let bytes = resolve_budget_bytes(None).unwrap();
         assert!(bytes >= MIN_DEFAULT_BUDGET_BYTES);

@@ -21,23 +21,41 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # SHA-256 payload integrity.
 sha2 = "0.10"
-# CLI.
-clap = { version = "4", features = ["derive"] }
 anyhow = "1"
+
+# ---- Native-only (the default `native` feature): libav I/O, filesystem, RAM detection
+# and the CLI. Without it the codec core builds anywhere, including wasm32 (see `wasm/`).
+clap = { version = "4", features = ["derive"], optional = true }
 # System RAM detection, for the default memory budget (n% of total RAM).
-sysinfo = "0.32"
+sysinfo = { version = "0.32", optional = true }
 # Atomic-rename output files (decode streams straight to a temp file, then persists it).
-tempfile = "3"
-
+tempfile = { version = "3", optional = true }
 # libav bindings (no subprocess). Pinned to the 6.1 line to match FFmpeg 6.1.x.
-ffmpeg-next = "6.1"
+ffmpeg-next = { version = "6.1", optional = true }
 
-# On Windows, statically link FFmpeg (+ libx264) into the binary so no FFmpeg DLLs
+# On Windows, statically link FFmpeg (+ libx264/libx265) into the binary so no FFmpeg DLLs
 # are shipped. The dev libraries come from vcpkg (x64-windows-static-md); see
 # scripts/setup-windows.ps1 and .cargo/config.toml. Cargo unions this feature with
 # the base dependency above, so non-Windows targets keep dynamic linking.
 [target.'cfg(windows)'.dependencies]
-ffmpeg-next = { version = "6.1", features = ["static"] }
+ffmpeg-next = { version = "6.1", features = ["static"], optional = true }
+
+[features]
+default = ["native"]
+native = ["dep:clap", "dep:sysinfo", "dep:tempfile", "dep:ffmpeg-next"]
+
+[[bin]]
+name = "framevault"
+path = "src/main.rs"
+required-features = ["native"]
+
+[[test]]
+name = "roundtrip"
+required-features = ["native"]
+
+[[test]]
+name = "media_spike"
+required-features = ["native"]
 
 [profile.release]
 opt-level = 3       # optimize for speed (not size)

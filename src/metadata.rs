@@ -1,14 +1,11 @@
 //! Payload framing and QR metadata. Mirrors the payload/QR helpers in
 //! encode.py / decode.py.
 
-use std::fs::File;
-use std::io::{self, BufReader, BufWriter, Read, Write};
-use std::path::{Path, PathBuf};
+use std::io::{self, Read, Write};
 
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tempfile::NamedTempFile;
 
 use crate::constants::{ENCODING_VERSION, METADATA_FRAMES};
 
@@ -35,19 +32,10 @@ pub fn sha256_hex(data: &[u8]) -> String {
     hex_digest(Sha256::digest(data))
 }
 
-/// Build the [`Meta`] for a file by streaming it: size from the filesystem, SHA-256
-/// by incremental hashing in fixed-size chunks. Never buffers the whole file, so it
-/// stays bounded in memory regardless of file size.
-pub fn build_meta(path: &Path) -> std::io::Result<Meta> {
-    let filename = path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("file.bin")
-        .to_string();
-    let size = std::fs::metadata(path)?.len();
-
+/// Build the [`Meta`] for `size` bytes read from `reader`, hashing incrementally in
+/// fixed-size chunks so the input is never buffered whole.
+pub fn build_meta_from_reader<R: Read>(filename: &str, size: u64, mut reader: R) -> io::Result<Meta> {
     let mut hasher = Sha256::new();
-    let mut reader = BufReader::new(File::open(path)?);
     let mut buf = [0u8; 64 * 1024];
     loop {
         let n = reader.read(&mut buf)?;
@@ -56,14 +44,22 @@ pub fn build_meta(path: &Path) -> std::io::Result<Meta> {
         }
         hasher.update(&buf[..n]);
     }
-    let sha256 = hex_digest(hasher.finalize());
-
     Ok(Meta {
         v: ENCODING_VERSION,
-        filename,
+        filename: filename.to_string(),
         size,
-        sha256,
+        sha256: hex_digest(hasher.finalize()),
     })
+}
+
+/// Build the [`Meta`] for a file by streaming it: size from the filesystem, SHA-256
+/// by incremental hashing. Bounded in memory regardless of file size.
+#[cfg(feature = "native")]
+pub fn build_meta(path: &std::path::Path) -> io::Result<Meta> {
+    let filename = path.file_name().and_then(|n| n.to_str()).unwrap_or("file.bin");
+    let size = std::fs::metadata(path)?.len();
+    let reader = io::BufReader::new(std::fs::File::open(path)?);
+    build_meta_from_reader(filename, size, reader)
 }
 
 /// Serialize just the payload header — `[4-byte BE meta length][meta JSON]` — without
@@ -165,31 +161,26 @@ enum HeaderState {
     Streaming,
 }
 
-/// Streams RS-decoded plaintext straight to disk: skips the embedded payload header,
-/// then writes the remaining file bytes to a temp file in `output_dir` while
-/// incrementally SHA-256 hashing them. Never holds the recovered file whole in memory.
-pub struct PayloadSink {
+/// Streams RS-decoded plaintext into a writer `W`: skips the embedded payload header,
+/// then writes the remaining file bytes while incrementally SHA-256 hashing them. Never
+/// holds the recovered file whole in memory (unless `W` itself does, e.g. `Vec<u8>`).
+pub struct PayloadSink<W: Write> {
     state: HeaderState,
-    writer: BufWriter<NamedTempFile>,
+    writer: W,
     hasher: Sha256,
     bytes_written: u64,
     remaining_file_bytes: u64,
-    out_path: PathBuf,
 }
 
-impl PayloadSink {
-    pub fn new(output_dir: &Path, filename: &str, expected_size: u64) -> io::Result<Self> {
-        // Created inside `output_dir` (not the system temp dir) so `FinishedPayload::persist`'s
-        // rename stays on the same filesystem.
-        let tmp = NamedTempFile::new_in(output_dir)?;
-        Ok(Self {
+impl<W: Write> PayloadSink<W> {
+    pub fn new(writer: W, expected_size: u64) -> Self {
+        Self {
             state: HeaderState::ReadingLenPrefix { have: Vec::with_capacity(4) },
-            writer: BufWriter::new(tmp),
+            writer,
             hasher: Sha256::new(),
             bytes_written: 0,
             remaining_file_bytes: expected_size,
-            out_path: output_dir.join(filename),
-        })
+        }
     }
 
     /// Feed the next chunk of RS-decoded plaintext, in stream order. A single chunk may
@@ -238,41 +229,69 @@ impl PayloadSink {
         Ok(())
     }
 
-    /// Flush to disk; consumes self and returns the computed digest + a handle that can
-    /// rename the temp file into place.
-    pub fn finish(mut self) -> Result<FinishedPayload> {
+    /// Write raw file bytes directly (no header to skip) — used by decode's fallback
+    /// path, which parses the header itself.
+    pub fn feed_file_bytes(&mut self, bytes: &[u8]) -> Result<()> {
+        self.state = HeaderState::Streaming;
+        self.feed(bytes)
+    }
+
+    /// Flush and return the computed digest along with the writer.
+    pub fn finish(mut self) -> Result<FinishedPayload<W>> {
         self.writer.flush()?;
-        let tmp = self
-            .writer
-            .into_inner()
-            .map_err(|e| anyhow!("flush recovered file: {e}"))?;
         Ok(FinishedPayload {
             sha256: hex_digest(self.hasher.finalize()),
             bytes_written: self.bytes_written,
-            tmp,
-            out_path: self.out_path,
+            writer: self.writer,
         })
     }
 }
 
-/// A fully-written, hashed recovered file, still sitting in a temp file pending
-/// [`FinishedPayload::persist`].
-pub struct FinishedPayload {
+/// A fully-written, hashed recovered file and the writer holding it.
+pub struct FinishedPayload<W> {
     pub sha256: String,
     pub bytes_written: u64,
-    tmp: NamedTempFile,
-    out_path: PathBuf,
+    pub writer: W,
 }
 
-impl FinishedPayload {
-    /// Rename into place. Called whether or not the hash matched (mirrors the prior
-    /// in-memory decoder's behavior of writing the recovered file before checking/bailing
-    /// on a mismatch, so a corrupted result is still left for inspection). On a hard error
-    /// before this point (RS failure, I/O error), the temp file is instead cleaned up
-    /// automatically by `NamedTempFile`'s `Drop`, leaving no partial output behind.
-    pub fn persist(self) -> Result<PathBuf> {
-        self.tmp.persist(&self.out_path)?;
+/// Native output target: a temp file inside the output directory, renamed into place
+/// by [`TempOutput::persist`]. Created in `output_dir` (not the system temp dir) so the
+/// rename stays on one filesystem. Dropped without persisting (a hard error mid-decode),
+/// `NamedTempFile` removes it, leaving no partial output behind.
+#[cfg(feature = "native")]
+pub struct TempOutput {
+    writer: io::BufWriter<tempfile::NamedTempFile>,
+    out_path: std::path::PathBuf,
+}
+
+#[cfg(feature = "native")]
+impl TempOutput {
+    pub fn create(output_dir: &std::path::Path, filename: &str) -> io::Result<Self> {
+        Ok(Self {
+            writer: io::BufWriter::new(tempfile::NamedTempFile::new_in(output_dir)?),
+            out_path: output_dir.join(filename),
+        })
+    }
+
+    /// Rename into place. Called whether or not the hash matched, so a corrupted result
+    /// is still left for inspection.
+    pub fn persist(self) -> Result<std::path::PathBuf> {
+        let tmp = self
+            .writer
+            .into_inner()
+            .map_err(|e| anyhow::anyhow!("flush recovered file: {e}"))?;
+        tmp.persist(&self.out_path)?;
         Ok(self.out_path)
+    }
+}
+
+#[cfg(feature = "native")]
+impl Write for TempOutput {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.writer.write(buf)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.writer.flush()
     }
 }
 
