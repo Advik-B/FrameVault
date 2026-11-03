@@ -163,7 +163,7 @@ mod native {
     use super::FrameEncoder;
     use crate::budget;
     use crate::constants::FRAME_RATE;
-    use crate::media::{self, VideoCodec};
+    use crate::media::{self, Preset, VideoCodec};
     use crate::metadata::build_meta;
 
     /// Summary of an encode run (also drives test assertions).
@@ -184,6 +184,7 @@ mod native {
         output_path: &Path,
         memory: Option<&str>,
         codec: VideoCodec,
+        preset: Preset,
     ) -> Result<EncodeReport> {
         // ---- [1/4] pass 1: stream-hash the file + build metadata ----
         println!("[1/4] Reading file: {}", input_path.display());
@@ -206,7 +207,7 @@ mod native {
             plan.total_frames, plan.duration_sec
         );
         println!("      Frame index:    {} bits", plan.index_bits);
-        println!("      Codec:          {codec}");
+        println!("      Codec:          {codec} (preset {preset})");
         println!(
             "      Memory budget:  {} MiB ({batch_blocks} RS blocks/batch)",
             budget_bytes / (1024 * 1024)
@@ -214,7 +215,7 @@ mod native {
 
         // ---- [3/4] pass 2: stream RS-encode + render frames, muxing via libav ----
         println!("\n[3/4] Generating frames, muxing via libav...");
-        media::encode_to_file(output_path, plan.total_frames, codec, |_| {
+        media::encode_to_file(output_path, plan.total_frames, codec, preset, |_| {
             encoder
                 .next_luma()?
                 .ok_or_else(|| anyhow!("frame encoder ended early"))

@@ -41,18 +41,23 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Build
         run: cargo build --release
-      - name: Test (includes H.264 and H.265 round trips through libav)
+      - name: Test (H.264 and H.265 round trips through libav, several presets)
         run: cargo test
       - name: CLI smoke test
         shell: bash
         run: |
           bin=target/release/framevault
           head -c 4096 /dev/urandom > smoke.bin
-          for codec in h264 h265; do
-            "$bin" encode smoke.bin "smoke-$codec.mp4" --codec "$codec"
-            mkdir -p "out-$codec"
-            "$bin" decode "smoke-$codec.mp4" "out-$codec"
-            cmp smoke.bin "out-$codec/smoke.bin"
+          # codec:preset pairs; the first uses the defaults (h264, fast).
+          for combo in default h264:ultrafast h264:veryslow h265:fast; do
+            args=()
+            [[ "$combo" != default ]] && args=(--codec "${combo%%:*}" --preset "${combo##*:}")
+            name="${combo/:/-}" # no colons in Windows file names
+            "$bin" encode smoke.bin "smoke-$name.mp4" "${args[@]}"
+            mkdir -p "out-$name"
+            "$bin" decode "smoke-$name.mp4" "out-$name"
+            cmp smoke.bin "out-$name/smoke.bin"
+            echo "$combo: $(wc -c < "smoke-$name.mp4") bytes"
           done
 
   web:

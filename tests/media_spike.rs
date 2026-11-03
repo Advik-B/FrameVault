@@ -21,7 +21,7 @@ fn libav_video_round_trip() {
     let mp4 = tmp.path().join("spike.mp4");
 
     let frames_for_closure = frames_data.clone();
-    media::encode_to_file(&mp4, n, media::VideoCodec::H264, move |idx| {
+    media::encode_to_file(&mp4, n, media::VideoCodec::H264, media::Preset::Fast, move |idx| {
         Ok(make_frame_luma(idx as u64, &frames_for_closure[idx], index_bits))
     })
     .expect("encode");

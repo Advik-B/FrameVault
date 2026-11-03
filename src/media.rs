@@ -34,9 +34,51 @@ pub enum VideoCodec {
     /// H.264 via libx264 (CRF 0). Fast; plays everywhere.
     #[default]
     H264,
-    /// H.265/HEVC via libx265 (lossless mode). Slower; at the `ultrafast` preset its files
-    /// come out larger than H.264's for FrameVault's block frames.
+    /// H.265/HEVC via libx265 (lossless mode). Slower to encode, and its files are no
+    /// smaller than H.264's for FrameVault's block frames.
     H265,
+}
+
+/// x264/x265 speed preset (both encoders share the names). Output is lossless at every
+/// preset, so this only trades encode time for file size, never data integrity.
+///
+/// Measured on 239 FrameVault frames (lossless x264 / x265): `ultrafast` 2.3 / 4.9 MB,
+/// `fast` 262 / 333 KB, `medium` 185 / 219 KB, `veryslow` 178 / 189 KB. Encode time grows
+/// from 1x (`ultrafast`) to about 1.5x (`fast`), 1.8x (`medium`) and 6.5x (`veryslow`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+pub enum Preset {
+    Ultrafast,
+    Superfast,
+    Veryfast,
+    Faster,
+    #[default]
+    Fast,
+    Medium,
+    Slow,
+    Slower,
+    Veryslow,
+}
+
+impl Preset {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Preset::Ultrafast => "ultrafast",
+            Preset::Superfast => "superfast",
+            Preset::Veryfast => "veryfast",
+            Preset::Faster => "faster",
+            Preset::Fast => "fast",
+            Preset::Medium => "medium",
+            Preset::Slow => "slow",
+            Preset::Slower => "slower",
+            Preset::Veryslow => "veryslow",
+        }
+    }
+}
+
+impl std::fmt::Display for Preset {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 impl VideoCodec {
@@ -47,9 +89,9 @@ impl VideoCodec {
         }
     }
 
-    fn options(self) -> Dictionary<'static> {
+    fn options(self, preset: Preset) -> Dictionary<'static> {
         let mut opts = Dictionary::new();
-        opts.set("preset", "ultrafast");
+        opts.set("preset", preset.as_str());
         match self {
             VideoCodec::H264 => opts.set("crf", "0"), // lossless H.264
             // x265's CRF 0 is *not* lossless; its lossless mode is a separate switch.
@@ -73,7 +115,6 @@ pub fn encoder_available(codec: VideoCodec) -> bool {
     ff_init().is_ok() && encoder::find_by_name(codec.encoder_name()).is_some()
 }
 
-
 /// Allocate a codec context bound to `codec` so it inherits that codec's own
 /// option defaults. A NULL-codec context (e.g. `Context::new`) carries ffmpeg's
 /// generic defaults, which makes libx264 reject the settings as "broken".
@@ -84,9 +125,9 @@ fn context_with_codec(c: ffmpeg::Codec) -> codec::context::Context {
 }
 
 /// Encode `num_video_frames` luma planes (1920x1080 Y bytes, produced on demand by
-/// `make_luma`) into a video-only MP4 at `output` with `video_codec`. Frames are fed to
-/// the encoder as YUV420P directly with neutral chroma, so there is no RGB->YUV swscale
-/// pass.
+/// `make_luma`) into a video-only MP4 at `output` with `video_codec` at `preset`. Frames
+/// are fed to the encoder as YUV420P directly with neutral chroma, so there is no
+/// RGB->YUV swscale pass.
 ///
 /// `make_luma` is pulled with strictly increasing indices `0..num_video_frames`, so it
 /// can drive a streaming generator; returning `Result` lets a mid-stream IO error from
@@ -95,6 +136,7 @@ pub fn encode_to_file<F>(
     output: &Path,
     num_video_frames: usize,
     video_codec: VideoCodec,
+    preset: Preset,
     mut make_luma: F,
 ) -> Result<()>
 where
@@ -123,7 +165,7 @@ where
         if global_header {
             enc.set_flags(codec::Flags::GLOBAL_HEADER);
         }
-        let enc = enc.open_as_with(vcodec, video_codec.options())?;
+        let enc = enc.open_as_with(vcodec, video_codec.options(preset))?;
         ost.set_parameters(&enc);
         if video_codec == VideoCodec::H265 {
             // Tag HEVC as `hvc1` (not libav's default `hev1`) so Apple players and

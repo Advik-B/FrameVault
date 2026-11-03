@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use framevault::media::VideoCodec;
+use framevault::media::{Preset, VideoCodec};
 
 #[derive(Parser)]
 #[command(
@@ -29,10 +29,14 @@ enum Command {
         /// system RAM.
         #[arg(long)]
         memory: Option<String>,
-        /// Video codec. H.265 is slower to encode and, at the fast lossless preset used,
-        /// makes larger files than H.264. Decode detects the codec on its own.
+        /// Video codec. H.265 is slower to encode and makes no smaller files than H.264
+        /// for FrameVault's frames. Decode detects the codec on its own.
         #[arg(long, value_enum, default_value = "h264")]
         codec: VideoCodec,
+        /// Encoder speed preset. Output is lossless at every preset; slower presets just
+        /// make smaller files (`fast` is ~9x smaller than `ultrafast` for ~1.5x the time).
+        #[arg(long, value_enum, default_value = "fast")]
+        preset: Preset,
     },
     /// Decode a FrameVault MP4 back into the original file.
     Decode {
@@ -51,8 +55,8 @@ enum Command {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Command::Encode { input, output, memory, codec } => {
-            framevault::encode::encode(&input, &output, memory.as_deref(), codec)?;
+        Command::Encode { input, output, memory, codec, preset } => {
+            framevault::encode::encode(&input, &output, memory.as_deref(), codec, preset)?;
         }
         Command::Decode { video, output_dir, memory } => {
             std::fs::create_dir_all(&output_dir)?;

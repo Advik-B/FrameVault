@@ -32,7 +32,8 @@ const THREADS = String(Math.max(1, Math.min(8, navigator.hardwareConcurrency || 
 export const CODECS = {
   h264: {
     label: "H.264",
-    // Lossless (CRF 0), the same settings the native CLI uses.
+    // Lossless (CRF 0). The browser uses the `ultrafast` preset for speed; the CLI
+    // defaults to `fast` (files ~9x smaller), see its --preset option.
     args: ["-c:v", "libx264", "-preset", "ultrafast", "-crf", "0"],
   },
   h265: {

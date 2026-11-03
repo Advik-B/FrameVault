@@ -222,10 +222,34 @@ cargo run --release -- encode <input_file> <output.mp4>
 
 The output is a standard H.264 MP4 ready to upload to YouTube at 1080p or higher.
 
-Add `--codec h265` for lossless H.265/HEVC instead, for workflows that want HEVC. At the fast
-`ultrafast` preset FrameVault uses, H.265 is slower to encode and its files come out *larger*
-than H.264's: 4.9 MB vs 2.3 MB for a 10 KB input. YouTube re-encodes every upload either way.
-Decode detects the codec by itself.
+#### Codec and preset
+
+The video is always **lossless**. Two options decide how big the MP4 is and how long encoding
+takes; neither affects what decodes:
+
+- `--preset <ultrafast|superfast|veryfast|faster|fast|medium|slow|slower|veryslow>` (default
+  `fast`): the x264/x265 speed preset.
+- `--codec h265`: lossless H.265/HEVC instead of H.264, for workflows that want HEVC. For
+  FrameVault's block frames it's slower than H.264 at every preset, and its files are no
+  smaller.
+
+Measured on the 239 frames of a 10 KB input:
+
+| Preset      | H.264 size | H.265 size | Encode time (vs `ultrafast`) |
+| ----------- | ---------- | ---------- | ---------------------------- |
+| `ultrafast` | 2.3 MB     | 4.9 MB     | 1×                           |
+| `fast`      | 262 KB     | 333 KB     | ~1.5×                        |
+| `medium`    | 185 KB     | 219 KB     | ~1.8×                        |
+| `veryslow`  | 178 KB     | 189 KB     | ~6.5×                        |
+
+```
+./target/release/framevault encode big.iso big.mp4 --preset medium
+./target/release/framevault encode clip.bin clip.mp4 --codec h265 --preset slow
+```
+
+YouTube re-encodes every upload either way, so this mostly saves local disk and upload time.
+Decode detects the codec by itself. The browser demo uses `ultrafast`, because slower presets
+cost far more in WebAssembly.
 
 ### Decode
 
