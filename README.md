@@ -6,6 +6,17 @@ binary data into video frames that survive re-encoding.
 This is not a product. It is a study. The codec is implemented in **pure Rust** (the original
 Python prototype lives in git history).
 
+It runs two ways, from the same codec:
+
+- **CLI** for Windows, Linux and macOS. Download it from
+  [Releases](https://github.com/Advik-B/FrameVault/releases) or [build it](#requirements).
+- **In the browser**: the codec compiled to WebAssembly, with
+  [ffmpeg.wasm](https://github.com/ffmpegwasm/ffmpeg.wasm) for the video. Try the
+  [live demo](https://advik-b.github.io/FrameVault/), or see
+  [In the browser](#in-the-browser-webassembly).
+
+Videos made by either one decode in the other.
+
 ---
 
 ## Concept
@@ -153,9 +164,16 @@ held whole in memory. Missing bytes become erasures scoped to whichever window t
 cargo build --release
 ```
 
+The FFmpeg-dependent parts (libav I/O, the CLI) sit behind the default `native` feature. The
+codec core builds and tests without FFmpeg at all:
+
+```
+cargo test --no-default-features   # RS, frames, QR, streaming encode/decode: no libav needed
+```
+
 ### Building on Windows
 
-On Windows the build links FFmpeg (+ libx264) **statically**, so the resulting
+On Windows the build links FFmpeg (+ libx264, libx265) **statically**, so the resulting
 `framevault.exe` is a self-contained single binary — no FFmpeg DLLs are shipped alongside it.
 The build uses the `x64-windows-static-md` triplet (static libs, dynamic CRT), so the binary
 still depends on the Microsoft Visual C++ runtime (`VCRUNTIME140.dll`) — install the
@@ -172,8 +190,10 @@ present. The static, MSVC-compatible libraries are built by
    ```
 
 The script clones + bootstraps vcpkg (under `%USERPROFILE%\vcpkg`) and builds
-`ffmpeg[x264]:x64-windows-static-md` (a **slow, one-time, from-source** build — GPL/libx264 is
-required because the encoder uses H.264 CRF 0; vcpkg auto-acquires nasm/cmake/ninja). FFmpeg is
+`ffmpeg[x264,x265]:x64-windows-static-md` (a **slow, one-time, from-source** build — GPL
+libx264/libx265 are required for the lossless H.264 and H.265 encoders; vcpkg auto-acquires
+nasm/cmake/ninja). An FFmpeg built by an older version of the script (without x265) is rebuilt
+automatically. FFmpeg is
 pinned to **6.1.1** to match the `ffmpeg-next = "6.1"` bindings (FFmpeg 7 removed the
 channel-layout API this code uses) via a committed overlay port at
 `scripts/vcpkg-overlay/ffmpeg`, layered on vcpkg's current baseline so x264 and the build tools
@@ -184,7 +204,8 @@ The `static` feature is enabled for Windows via a `[target.'cfg(windows)']` depe
 machine — `.cargo/config.toml` holds machine-specific absolute paths.
 
 > **Note:** the committed `.cargo/config.toml` is Windows-specific (its `[env]` paths apply on
-> every platform). When building on Linux/macOS, delete it first — the system
+> every platform). When building on Linux/macOS, delete it first, or set `LIBCLANG_PATH` in your
+> environment, which takes precedence (CI does the latter). The system
 > `pkg-config`/`libclang` setup described above needs no config file.
 
 ---
@@ -200,6 +221,11 @@ cargo run --release -- encode <input_file> <output.mp4>
 ```
 
 The output is a standard H.264 MP4 ready to upload to YouTube at 1080p or higher.
+
+Add `--codec h265` for lossless H.265/HEVC instead, for workflows that want HEVC. At the fast
+`ultrafast` preset FrameVault uses, H.265 is slower to encode and its files come out *larger*
+than H.264's: 4.9 MB vs 2.3 MB for a 10 KB input. YouTube re-encodes every upload either way.
+Decode detects the codec by itself.
 
 ### Decode
 
@@ -236,6 +262,90 @@ RAM** (floored at 64 MiB):
 ./target/release/framevault encode myfile.bin myfile.mp4
 ./target/release/framevault decode myfile.mp4 ./recovered/
 ```
+
+---
+
+## In the browser (WebAssembly)
+
+`web/` is a browser app that encodes and decodes FrameVault videos entirely client-side:
+nothing is uploaded. It runs the **same Rust codec** as the CLI, compiled to WebAssembly
+(`wasm/`, via wasm-bindgen), and uses **ffmpeg.wasm** (the multi-threaded core, with libx264 and
+libx265) for the MP4 side. The demo is styled with the Purrimer design system (Blanc and Noir
+themes).
+
+```
+                 Rust codec (wasm)                     ffmpeg.wasm
+encode:  file -> FrameEncoder -> raw yuv420p frames -> libx264/libx265 -> MP4 parts -> concat
+decode:  MP4 -> seek + decode a chunk -> 8-bit luma -> FrameDecoder -> file (+ SHA-256 check)
+```
+
+Each frame carries only 57 bytes, but a raw 1080p frame is 3 MB, so the browser never holds a
+whole video's raw frames:
+
+- **Encode** pipes 48 frames at a time through x264/x265 and concatenates the compressed parts.
+- **Decode** seeks through the MP4 96 frames at a time and passes only the luma plane (2 MB per
+  frame). Each frame carries its own index, so the couple of frames re-read at each chunk seam
+  are harmless.
+
+### Build and run
+
+Requires Rust with the `wasm32-unknown-unknown` target,
+[wasm-pack](https://github.com/drager/wasm-pack) and Node 20+.
+
+```
+rustup target add wasm32-unknown-unknown
+cd web
+npm install
+npm run build:wasm     # wasm-pack build ../wasm -> web/pkg
+npm run dev            # http://localhost:5173
+npm run build          # static site in web/dist
+```
+
+### Notes
+
+- **Threads need cross-origin isolation.** ffmpeg.wasm's multi-threaded core uses
+  `SharedArrayBuffer`, which browsers only expose when the page is served with
+  `Cross-Origin-Opener-Policy: same-origin` and `Cross-Origin-Embedder-Policy: require-corp`.
+  The Vite dev and preview servers send both. For static hosts that can't, such as GitHub
+  Pages, `web/public/coi-serviceworker.js` adds them via a service worker.
+- **ffmpeg.wasm is served as-is** from `web/public/ffmpeg/`, copied from `node_modules` before
+  each dev or build run. In dev, Vite would otherwise rewrite the core's classic pthread worker
+  and break every ffmpeg thread. ffmpeg's thread counts are also capped, because "auto" can ask
+  for more threads than ffmpeg.wasm's fixed pthread pool holds, which deadlocks it.
+- **Speed.** Small files take seconds. Very large files are better done with the CLI, which is
+  several times faster and isn't bound by a browser tab's memory.
+- **H.265 previews.** Not every browser can play HEVC in a `<video>` element (Firefox can't), but
+  the file is still valid, and the demo can still decode it.
+
+The `wasm/` package can also be used on its own. It exports `Encoder` (a file to raw yuv420p
+frames), `Decoder` (rgb24 or luma frames to the file) and the frame geometry helpers. See
+`web/src/pipeline.js` for a complete example of driving it with ffmpeg.wasm.
+
+---
+
+## Releases & CI
+
+GitHub Actions (`.github/workflows/`) builds every flavour:
+
+| Workflow      | When                       | What                                                                                                                                         |
+| ------------- | -------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
+| `ci.yml`      | Every push and PR          | Core tests without FFmpeg; native build, tests and an H.264/H.265 CLI round trip on Linux, macOS and Windows; the wasm package and web demo build |
+| `pages.yml`   | Push to `master`           | Deploys the demo to GitHub Pages (set Settings → Pages → Source to "GitHub Actions" once)                                                  |
+| `release.yml` | A release is published     | Attaches the assets below to the release                                                                                                     |
+
+Release assets:
+
+- `framevault-windows-x86_64.zip`: a static, self-contained `framevault.exe`, built through
+  `scripts/setup-windows.ps1`.
+- `framevault-linux-x86_64.tar.gz`: links the system FFmpeg 6.1 (Ubuntu 24.04:
+  `sudo apt install ffmpeg`).
+- `framevault-macos-arm64.tar.gz`: links Homebrew's FFmpeg 6 (`brew install ffmpeg@6`).
+- `framevault-wasm.tar.gz`: the WebAssembly codec package (wasm-pack, `--target web`).
+- `framevault-web.zip`: the browser demo, ready for any static host.
+
+The FFmpeg setup for each OS lives in `.github/actions/setup-ffmpeg`. The Windows FFmpeg build
+is cached, so only the first run (or a change to the setup script or overlay port) builds it
+from source.
 
 ---
 
@@ -321,15 +431,23 @@ src/
   stream.rs      StreamingEcc: payload Read -> block-aligned RS ECC byte stream
   qr.rs          QR metadata frame generation (qrcode) + decode (rqrr)
   metadata.rs    streaming hash, payload framing + QR metadata (serde)
-  media.rs       libav encode (mux) / decode (demux) pipeline, video-only
-  encode.rs      two-pass streaming encode pipeline + report
-  decode.rs      streaming decode pipeline (video-only RS) + report
-  main.rs        clap CLI
+  media.rs       libav encode (mux) / decode (demux) pipeline, video-only, H.264/H.265  [native]
+  encode.rs      FrameEncoder (I/O-free) + the two-pass file encode pipeline [native]
+  decode.rs      FrameDecoder (I/O-free, windowed RS) + the file decode pipeline [native]
+  main.rs        clap CLI [native]
 tests/
   helpers.rs     codec-helper unit tests (frame-index selection, RS round-trips)
-  roundtrip.rs   real encode -> MP4 -> decode -> verify
+  roundtrip.rs   real encode -> MP4 -> decode -> verify (H.264 and H.265)
   media_spike.rs low-level libav round-trip
+wasm/            wasm-bindgen bindings over FrameEncoder / FrameDecoder
+web/             browser demo: Vite + React + Purrimer, ffmpeg.wasm for the video
+  src/pipeline.js  chunked encode/decode driving the wasm codec and ffmpeg.wasm
+scripts/         Windows FFmpeg setup (vcpkg) and the pinned FFmpeg 6.1.1 overlay port
+.github/         CI, Pages deploy and release workflows
 ```
+
+`[native]` marks code behind the default `native` feature, which needs FFmpeg. Everything else
+also compiles to `wasm32-unknown-unknown`.
 
 Run the suite with `cargo test` (the heavy 100 KB round-trip is `#[ignore]`d; run it with
 `cargo test --release -- --ignored`). `stream.rs` includes a test asserting the streamed ECC
